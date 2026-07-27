@@ -1,5 +1,5 @@
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -34,10 +34,10 @@ model Trip {
 
 model Expense {
   id        String   @id @default(cuid())
-  title     String              // 消费项目（如「普陀山门票」「晚餐海鲜」）
-  amount    Float               // 金额（元）
-  payer     String              // 付款人昵称
-  shareWith String              // 参与分摊的人，JSON 数组字符串（如「["我","爸","妈"]」）
+  title     String
+  amount    Float
+  payer     String
+  shareWith String
   createdAt DateTime @default(now())
   tripId    String
   trip      Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
