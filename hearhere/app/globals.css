@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #fbf9f7;
+  --foreground: #2d2e30;
+  --muted: #8e9196;
+  --vibe-sea: #a2c2e1;
+  --vibe-forest: #b4cbb7;
+  --vibe-dusk: #e9c46a;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  min-height: 100vh;
+}
+
+
+.font-serif {
+  font-family: var(--font-noto-serif), "Noto Serif SC", serif;
+}

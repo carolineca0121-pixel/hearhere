@@ -1,0 +1,63 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "darwin", "darwin-arm64", "debian-openssl-3.0.x"]
+}
+
+model User {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  password  String
+  trips     Trip[]
+  createdAt DateTime @default(now())
+}
+
+model Trip {
+  id          String    @id @default(cuid())
+  destination String
+  startDate   DateTime?
+  endDate     DateTime?
+  preferences String
+  vibeTheme   String?
+  shareToken  String?   @unique
+  moments     Moment[]
+  itineraries DayPlan[]
+  expenses    Expense[]
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+}
+
+model Expense {
+  id        String   @id @default(cuid())
+  title     String              // 消费项目（如「普陀山门票」「晚餐海鲜」）
+  amount    Float               // 金额（元）
+  payer     String              // 付款人昵称
+  shareWith String              // 参与分摊的人，JSON 数组字符串（如「["我","爸","妈"]」）
+  createdAt DateTime @default(now())
+  tripId    String
+  trip      Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model Moment {
+  id          String @id @default(cuid())
+  title       String
+  description String
+  vibeColor   String
+  musicHint   String
+  imageUrl    String?
+  tripId      String
+  trip        Trip   @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}
+
+model DayPlan {
+  id       String @id @default(cuid())
+  dayIndex Int
+  content  String
+  tripId   String
+  trip     Trip   @relation(fields: [tripId], references: [id], onDelete: Cascade)
+}

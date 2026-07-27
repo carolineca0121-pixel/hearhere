@@ -1,0 +1,50 @@
+[
+  {
+    "id": "1",
+    "title": "栈桥落日观景台",
+    "review": "风大但真的美，傍晚六点后人少，适合安静看海。",
+    "reason": "满足「看落日」与「少走路」的折中选择",
+    "imageUrl": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800&q=80",
+    "sourceUrl": "https://example.com/review/1"
+  },
+  {
+    "id": "2",
+    "title": "小麦岛公园",
+    "review": "草坪开阔，适合一家人野餐，傍晚光线温柔。",
+    "reason": "兼顾休闲与拍照，老人可在岸边休息",
+    "imageUrl": "https://images.unsplash.com/photo-1473496169904-658ba7c44d08?w=800&q=80",
+    "sourceUrl": "https://example.com/review/2"
+  },
+  {
+    "id": "3",
+    "title": "老城文艺街区",
+    "review": "小巷好逛，咖啡多，适合喜欢逛街的一路逛吃。",
+    "reason": "满足逛街偏好，步行强度可控",
+    "imageUrl": "https://images.unsplash.com/photo-1449824913935-59a10b8d2000?w=800&q=80",
+    "sourceUrl": "https://example.com/review/3"
+  },
+  {
+    "id": "4",
+    "title": "崂山北九水",
+    "review": "溪水清澈，台阶不多的一段很适合轻徒步。",
+    "reason": "满足轻度爬山，又不至于太累",
+    "imageUrl": "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=800&q=80",
+    "sourceUrl": "https://example.com/review/4"
+  },
+  {
+    "id": "5",
+    "title": "海边露台餐厅",
+    "review": "景观位要提前订，菜品一般但氛围满分。",
+    "reason": "适合作为 High Moment 前的晚宴地点",
+    "imageUrl": "https://images.unsplash.com/photo-1414235077428-338989a2e8c0?w=800&q=80",
+    "sourceUrl": "https://example.com/review/5"
+  },
+  {
+    "id": "6",
+    "title": "海洋科技馆",
+    "review": "室内为主，雨天备选，小朋友会喜欢。",
+    "reason": "天气不好时的舒适备选",
+    "imageUrl": "https://images.unsplash.com/photo-1559827260-dc66d52bef19?w=800&q=80",
+    "sourceUrl": "https://example.com/review/6"
+  }
+]
