@@ -36,7 +36,9 @@ export async function POST(req: Request) {
       username: user.username,
       message: "注册成功，请登录",
     });
-  } catch {
-    return NextResponse.json({ error: "注册失败" }, { status: 500 });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.error("[register] error:", message);
+    return NextResponse.json({ error: "注册失败", detail: message }, { status: 500 });
   }
 }
