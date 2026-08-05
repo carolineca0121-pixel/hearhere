@@ -7,6 +7,7 @@ import { BreathButton } from "@/components/voice/breath-button";
 import { GlassCard } from "@/components/layout/glass-card";
 import { Button } from "@/components/ui/button";
 import { useSessionStore } from "@/stores/session";
+import { getMicErrorMessage } from "@/lib/mic";
 import Link from "next/link";
 import {
   Sparkles,
@@ -94,8 +95,8 @@ export default function HomePage() {
       mediaRef.current = recorder;
       recorder.start();
       setIsRecording(true);
-    } catch {
-      setError("无法访问麦克风，请检查浏览器权限");
+    } catch (e) {
+      setError(getMicErrorMessage(e));
     }
   };
 

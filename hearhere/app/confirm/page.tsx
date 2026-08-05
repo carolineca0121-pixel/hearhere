@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { GlassCard } from "@/components/layout/glass-card";
 import { Button } from "@/components/ui/button";
 import { useSessionStore } from "@/stores/session";
+import { getMicErrorMessage } from "@/lib/mic";
 import {
   Mic,
   X,
@@ -322,7 +323,7 @@ export default function ConfirmPage() {
       mediaRef.current = recorder;
       recorder.start();
       setIsRecording(true);
-    } catch { setError("无法访问麦克风，请检查浏览器权限"); }
+    } catch (e) { setError(getMicErrorMessage(e)); }
   };
 
   const stopAppendingRecording = () => { mediaRef.current?.stop(); setIsRecording(false); };

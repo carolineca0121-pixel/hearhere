@@ -115,6 +115,12 @@ export interface BuilderState {
   selectedCategories: ContentCategory[];
 }
 
+// ========== 行程断舍离（主动舍弃的愿望清单地点） ==========
+export interface OmittedSpot {
+  title: string;   // 被舍弃的地点名称（对应用户选中的卡片 title）
+  reason: string;  // 具体客观理由（距离过远/容量超载/高风险依赖/严重同质）
+}
+
 export interface DayPlanItem {
   time: string;
   activity: string;

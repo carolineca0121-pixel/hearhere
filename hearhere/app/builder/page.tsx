@@ -31,6 +31,7 @@ export default function BuilderPage() {
     addSelectedCard,
     selectedFoods,
     addSelectedFood,
+    transcript,
   } = useSessionStore();
   const [isAutoGenerating, setIsAutoGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -146,6 +147,7 @@ export default function BuilderPage() {
           },
           selectedCards: cards,
           selectedFoods: foods,
+          rawUserText: transcript,
         }),
       });
 

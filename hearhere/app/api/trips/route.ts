@@ -10,14 +10,17 @@ import type {
   ExtractedTags,
   HarmonyResult,
   InsightCard,
+  OmittedSpot,
   VibeTheme,
 } from "@/lib/types";
 
 interface TripGenerateResponse {
+  planningThought?: string;
   title?: string;
   vibeTheme: VibeTheme;
   overview?: string;
   travelTips?: string[];
+  omittedSpots?: OmittedSpot[];
   days: {
     dayIndex: number;
     items: {
@@ -59,6 +62,7 @@ export async function POST(req: Request) {
     const body = (await req.json()) as {
       destination?: string;
       tags?: ExtractedTags;
+      rawUserText?: string;
       selectedCards?: InsightCard[];
       selectedFoods?: InsightCard[];
       harmony?: HarmonyResult;
@@ -129,7 +133,8 @@ export async function POST(req: Request) {
         }
       }
 
-      const prompt = tripPrompt(destination, enrichedTags, selectedCards, autoHarmony, drivingRoute);
+      const rawUserText = body.rawUserText?.trim() || undefined;
+      const prompt = tripPrompt(destination, enrichedTags, selectedCards, rawUserText, autoHarmony, drivingRoute);
       console.log("[trips] calling ollamaJson, prompt length:", prompt.length);
       generated = await ollamaJson<TripGenerateResponse>(prompt);
       console.log("[trips] ollamaJson success, days:", generated.days?.length);
@@ -378,8 +383,22 @@ export async function POST(req: Request) {
       }
     }
 
-    // 3. 【极其重要】选中卡片强制插入：检查每个选中卡片是否出现在 days 里，必须一个不漏
-    const selectedTitles = selectedCards.map((c) => c.title);
+    // 3. 【极其重要】选中卡片强制插入：检查每个选中卡片是否出现在 days 里
+    // 断舍离机制：AI 在 omittedSpots 里说明理由主动舍弃的卡片，尊重其判断，不再强制插回
+    const omittedTitles = new Set(
+      (generated.omittedSpots ?? []).map((o) => o.title)
+    );
+    if (omittedTitles.size > 0) {
+      console.log("[trips] AI 主动舍弃的地点:", Array.from(omittedTitles));
+    }
+    const selectedTitles = selectedCards
+      .map((c) => c.title)
+      .filter((title) =>
+        // 模糊匹配 omittedSpots（防止「普济寺」vs「普济寺景区」对不上）
+        !Array.from(omittedTitles).some(
+          (omitted) => omitted.includes(title) || title.includes(omitted)
+        )
+      );
     if (selectedTitles.length > 0) {
       // 收集现有活动
       const existingActivities = new Set(
@@ -545,6 +564,9 @@ export async function POST(req: Request) {
           title: generated.title,
           overview: generated.overview,
           travelTips: generated.travelTips,
+          omittedSpots: generated.omittedSpots ?? [],
+          planningThought: generated.planningThought ?? "",
+          rawUserText: body.rawUserText ?? "",
         }),
         vibeTheme: finalTheme,
         userId: session.user.id,

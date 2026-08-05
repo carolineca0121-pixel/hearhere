@@ -27,6 +27,7 @@ export default function FoodsPage() {
   const {
     tags,
     harmony,
+    transcript,
     selectedCards,
     foodCards,
     selectedFoods,
@@ -101,6 +102,7 @@ export default function FoodsPage() {
         body: JSON.stringify({
           destination: tags.destination,
           tags,
+          rawUserText: transcript,
           selectedCards,
           selectedFoods,
           harmony,

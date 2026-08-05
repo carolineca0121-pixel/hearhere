@@ -7,6 +7,7 @@ import { MeshBackground } from "@/components/layout/mesh-background";
 import { BreathButton } from "@/components/voice/breath-button";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import type { VibeTheme, DayPlanItem } from "@/lib/types";
+import { getMicErrorMessage } from "@/lib/mic";
 import {
   Clock, Bus, Coins, Lightbulb, Sparkles, MapPin,
   ChevronLeft, Home, RotateCcw, Utensils, Mic,
@@ -74,6 +75,7 @@ export default function TripPage() {
   const [adjusting, setAdjusting] = useState(false);
   const [adjustText, setAdjustText] = useState("");
   const [expandedDays, setExpandedDays] = useState<Set<number>>(new Set([1]));
+  const [thoughtExpanded, setThoughtExpanded] = useState(true);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
   const [sharing, setSharing] = useState(false);
@@ -280,11 +282,13 @@ export default function TripPage() {
   let title = "";
   let overview = "";
   let travelTips: string[] = [];
+  let planningThought = "";
   try {
     const pref = JSON.parse(trip.preferences);
     title = pref.title ?? "";
     overview = pref.overview ?? "";
     travelTips = pref.travelTips ?? [];
+    planningThought = pref.planningThought ?? "";
   } catch { /* ignore */ }
   const displayTitle = title || `${trip.destination} · 我的旅行攻略`;
 
@@ -357,6 +361,49 @@ export default function TripPage() {
                 <p className="text-sm leading-relaxed text-charcoal/80">{overview}</p>
               </div>
             </GlassCard>
+          </div>
+        )}
+
+        {/* ── ✨ AI 规划心路历程 ── */}
+        {planningThought && (
+          <div className="px-4 pt-3">
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.15 }}
+              className="rounded-2xl border border-amber-200/60 bg-amber-50/50 backdrop-blur-md shadow-sm overflow-hidden"
+            >
+              <button
+                onClick={() => setThoughtExpanded((v) => !v)}
+                className="w-full flex items-center justify-between px-4 py-3 text-left"
+              >
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+                  <span className="text-xs font-medium text-amber-800/90">
+                    AI 的规划心路历程
+                  </span>
+                </div>
+                <ChevronDown
+                  className={`w-3.5 h-3.5 text-amber-600/70 transition-transform duration-200 ${
+                    thoughtExpanded ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+              <AnimatePresence initial={false}>
+                {thoughtExpanded && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.25 }}
+                  >
+                    <p className="px-4 pb-4 text-sm italic leading-relaxed text-amber-900/70 border-t border-amber-200/40 pt-3">
+                      {planningThought}
+                    </p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </motion.div>
           </div>
         )}
 
@@ -770,8 +817,8 @@ export default function TripPage() {
                 setTimeout(() => {
                   if (recorder.state === "recording") recorder.stop();
                 }, 5000);
-              } catch {
-                // 麦克风不可用则忽略
+              } catch (e) {
+                alert(getMicErrorMessage(e));
               }
             }}
             onStop={() => { /* recorder auto-stops */ }}
