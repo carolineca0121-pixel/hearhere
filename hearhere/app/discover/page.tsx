@@ -164,7 +164,7 @@ export default function DiscoverPage() {
     <div className="flex flex-col min-h-screen bg-parchment/30">
       {/* ── 地图区 ── */}
       <div className="relative">
-        <AmapView markers={markers} className="w-full h-[38vh]" />
+        <AmapView markers={markers} city={destination} className="w-full h-[38vh]" />
         <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
           <GlassCard className="inline-flex items-center gap-2 px-3 py-1.5 shadow-sm">
             <MapPin className="w-3.5 h-3.5 text-vibe-sea" />

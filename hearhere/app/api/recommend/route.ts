@@ -19,6 +19,9 @@ import { searchPOIsBatch } from "@/lib/amap";
 import { ollamaJson } from "@/lib/ollama";
 import type { NormalizedPOI } from "@/lib/amap-types";
 
+// Vercel 免费版 Serverless 默认 10s 超时，这个管道要串行 3 次 LLM + N 次高德请求，必须放宽
+export const maxDuration = 60;
+
 // ── 去重 ──────────────────────────────────────────────
 
 function deduplicate(pois: NormalizedPOI[]): NormalizedPOI[] {
@@ -368,7 +371,7 @@ export async function POST(request: Request) {
       console.log(`[recommend] Amap returned ${pois.length} POIs`);
     } catch (e) {
       console.error("[recommend] Amap search failed:", e);
-      return NextResponse.json({ pois: [], count: 0 });
+      return NextResponse.json({ pois: [], count: 0, _error: `amap: ${e instanceof Error ? e.message : String(e)}` });
     }
 
     // 3. 去重 + 质量过滤
@@ -407,6 +410,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ pois: items, count: items.length, _debug: { keywords, searchCity }, _v: 2 });
   } catch (error) {
     console.error("[recommend]", error);
-    return NextResponse.json({ pois: [], count: 0 });
+    return NextResponse.json({ pois: [], count: 0, _error: error instanceof Error ? error.message : String(error) });
   }
 }

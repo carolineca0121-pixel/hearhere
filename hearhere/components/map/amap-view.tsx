@@ -7,6 +7,8 @@
 import { useEffect, useRef, useState } from "react";
 
 const AMAP_JS_KEY = "13357beee837c8a8cfbcfb9828b88e2a";
+// 高德 2021 年新规：JS API 必须配套安全密钥，否则线上环境拒绝服务（地图白屏）
+const AMAP_SECURITY_CODE = "5f3d5a4cf24c684699f9446a69f2e2ec";
 
 export interface MapMarker {
   id: string;
@@ -32,6 +34,7 @@ function loadAmap(): Promise<void> {
   if (amapLoaded) return Promise.resolve();
   if (amapLoadPromise) return amapLoadPromise;
   amapLoadPromise = new Promise((resolve) => {
+    (window as any)._AMapSecurityConfig = { securityJsCode: AMAP_SECURITY_CODE };
     const script = document.createElement("script");
     script.src = `https://webapi.amap.com/maps?v=2.0&key=${AMAP_JS_KEY}`;
     script.onload = () => { amapLoaded = true; resolve(); };
@@ -103,6 +106,14 @@ export function AmapView({ markers, city, onMarkerClick, className }: AmapViewPr
     markersRef.current = create;
     if (create.length > 0) mapRef.current.setFitView(null, false, [80, 80, 80, 320]);
   }, [markers, ready, onMarkerClick]);
+
+  // 城市兜底：没有任何 marker 时，地图也要聚焦到目的地城市（否则白屏）
+  useEffect(() => {
+    if (!ready || !mapRef.current || !city || markers.length > 0) return;
+    try {
+      mapRef.current.setCity(city);
+    } catch { /* 城市名无法识别时保持默认中心 */ }
+  }, [ready, city, markers.length]);
 
   return (
     <>

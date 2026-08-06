@@ -380,7 +380,7 @@ export default function TripPage() {
                 <div className="flex items-center gap-2">
                   <Sparkles className="w-3.5 h-3.5 text-amber-500" />
                   <span className="text-xs font-medium text-amber-800/90">
-                    AI 的规划心路历程
+                    🛎️ 旅行管家手记
                   </span>
                 </div>
                 <ChevronDown
@@ -397,9 +397,14 @@ export default function TripPage() {
                     exit={{ height: 0, opacity: 0 }}
                     transition={{ duration: 0.25 }}
                   >
-                    <p className="px-4 pb-4 text-sm italic leading-relaxed text-amber-900/70 border-t border-amber-200/40 pt-3">
-                      {planningThought}
-                    </p>
+                    <div className="border-t border-amber-200/40">
+                      <p className="px-4 pt-2.5 text-[11px] text-amber-700/60">
+                        本方案的设计考量与细节提示
+                      </p>
+                      <p className="px-4 pb-4 pt-1.5 text-sm italic leading-relaxed text-amber-900/70">
+                        {planningThought}
+                      </p>
+                    </div>
                   </motion.div>
                 )}
               </AnimatePresence>
