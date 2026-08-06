@@ -15,6 +15,7 @@ interface SessionState {
   refinedTranscript: string;
   tags: ExtractedTags | null;
   harmony: HarmonyResult | null;
+  screenshotPlaces: string[];   // 📷 截图 OCR 识别出的地名列表
   insightCards: InsightCard[];
   selectedCards: InsightCard[];
   foodCards: InsightCard[];
@@ -30,6 +31,7 @@ interface SessionState {
   setRefinedTranscript: (t: string) => void;
   setTags: (tags: ExtractedTags | null) => void;
   setHarmony: (h: HarmonyResult | null) => void;
+  setScreenshotPlaces: (places: string[]) => void;
   setInsightCards: (cards: InsightCard[]) => void;
   addSelectedCard: (card: InsightCard) => void;
   removeSelectedCard: (id: string) => void;
@@ -91,6 +93,7 @@ export const useSessionStore = create<SessionState>()(
       refinedTranscript: "",
       tags: null,
       harmony: null,
+      screenshotPlaces: [],
       insightCards: [],
       selectedCards: [],
       foodCards: [],
@@ -113,6 +116,7 @@ export const useSessionStore = create<SessionState>()(
         });
       },
       setHarmony: (harmony) => set({ harmony }),
+      setScreenshotPlaces: (screenshotPlaces) => set({ screenshotPlaces }),
       setInsightCards: (insightCards) => set({ insightCards }),
       addSelectedCard: (card) =>
         set((s) => ({
@@ -204,6 +208,7 @@ export const useSessionStore = create<SessionState>()(
           refinedTranscript: "",
           tags: null,
           harmony: null,
+          screenshotPlaces: [],
           insightCards: [],
           selectedCards: [],
           foodCards: [],

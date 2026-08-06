@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Building2, Users, Clock, Car, X, AlertTriangle } from "lucide-react";
+import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Building2, Users, Clock, Car, X, AlertTriangle, Check } from "lucide-react";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
@@ -50,7 +50,7 @@ const CUISINE_CHIPS = [
 
 export default function DiscoverPage() {
   const router = useRouter();
-  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript } = useSessionStore();
+  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces } = useSessionStore();
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
     attraction: [], food: [], souvenir: [], hotel: [],
@@ -58,6 +58,8 @@ export default function DiscoverPage() {
   const [loading, setLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const poiCoordsRef = useRef<Map<string, { lng: number; lat: number }>>(new Map());
+  // 📷 截图地名只自动加入一次（用户手动移除后不强行加回）
+  const shotAutoAddedRef = useRef(false);
 
   // 美食筛选
   const [mealType, setMealType] = useState("");
@@ -160,6 +162,41 @@ export default function DiscoverPage() {
 
   useEffect(() => { setSelectedIds(new Set(selectedContent.map((c) => c.id))); }, [selectedContent]);
 
+  // 📷 截图 OCR 联动：识别出的地名默认作为已选卡片置顶
+  useEffect(() => {
+    if (!_hydrated || shotAutoAddedRef.current || screenshotPlaces.length === 0) return;
+    shotAutoAddedRef.current = true;
+    for (const name of screenshotPlaces) {
+      const id = `shot-${name}`;
+      if (selectedContent.some((c) => c.id === id)) continue;
+      addContentCard({
+        id,
+        title: name,
+        description: "来自你的截图",
+        reason: "截图中识别出的地点",
+        category: "attraction",
+        status: "selected",
+      });
+    }
+  }, [_hydrated, screenshotPlaces, selectedContent, addContentCard]);
+
+  // 📷 截图卡片点击切换（加回/移除）
+  const handleShotToggle = (name: string) => {
+    const id = `shot-${name}`;
+    if (selectedContent.some((c) => c.id === id)) {
+      removeContentCard(id);
+    } else {
+      addContentCard({
+        id,
+        title: name,
+        description: "来自你的截图",
+        reason: "截图中识别出的地点",
+        category: "attraction",
+        status: "selected",
+      });
+    }
+  };
+
   const handleToggle = (card: PoiCardData) => {
     if (selectedIds.has(card.id)) { removeContentCard(card.id); }
     else {
@@ -227,6 +264,37 @@ export default function DiscoverPage() {
                   ))}
                 </>
               )}
+            </div>
+          </GlassCard>
+        </div>
+      )}
+
+      {/* ── 📷 根据你的截图识别出的地点 ── */}
+      {screenshotPlaces.length > 0 && (
+        <div className="px-4 mt-2">
+          <GlassCard className="px-4 py-2.5">
+            <p className="text-xs font-medium text-charcoal/80 mb-1.5">
+              📷 根据你的截图识别出的地点
+              <span className="text-muted/60 font-normal ml-1">已默认帮你选上，点可取消</span>
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {screenshotPlaces.map((name) => {
+                const isOn = selectedContent.some((c) => c.id === `shot-${name}`);
+                return (
+                  <button
+                    key={name}
+                    onClick={() => handleShotToggle(name)}
+                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs transition-colors ${
+                      isOn
+                        ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-sm"
+                        : "bg-white/60 text-muted border border-charcoal/10"
+                    }`}
+                  >
+                    {isOn && <Check className="w-3 h-3" />}
+                    {name}
+                  </button>
+                );
+              })}
             </div>
           </GlassCard>
         </div>

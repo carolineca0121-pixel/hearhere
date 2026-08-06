@@ -42,7 +42,7 @@ const FLOW_STEPS = [
 export default function HomePage() {
   const router = useRouter();
   const { data: session, status } = useSession();
-  const { reset, setTranscript, setRefinedTranscript, setTags } = useSessionStore();
+  const { reset, setTranscript, setRefinedTranscript, setTags, setScreenshotPlaces } = useSessionStore();
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -176,6 +176,7 @@ export default function HomePage() {
       setTranscript("");
       setRefinedTranscript("");
       setTags(data.tags);
+      setScreenshotPlaces(data.mentionedPlaces ?? []);
       router.push("/confirm");
     } catch (e) {
       setError(e instanceof Error ? e.message : "图片识别失败，请换一张试试");

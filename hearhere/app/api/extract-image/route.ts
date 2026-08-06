@@ -63,7 +63,7 @@ export async function POST(req: Request) {
     const base64 = Buffer.from(arrayBuffer).toString("base64");
 
     // 调视觉模型提取
-    const llmTags = await ollamaVisionJson<Partial<ExtractedTags>>(
+    const llmTags = await ollamaVisionJson<Partial<ExtractedTags> & { mentionedPlaces?: string[] }>(
       visionExtractPrompt(),
       base64,
       file.type,
@@ -92,6 +92,10 @@ export async function POST(req: Request) {
       refinedTranscript: "",  // 截图没有文字转写，confirm 页不显示原文
       originalTranscript: "",
       tags: normalized,
+      // 📷 截图中识别出的具体地名（Page 3 置顶为已选卡片）
+      mentionedPlaces: Array.isArray(llmTags.mentionedPlaces)
+        ? llmTags.mentionedPlaces.filter((p): p is string => typeof p === "string" && p.trim().length >= 2).slice(0, 12)
+        : [],
       source: "image",
     });
   } catch (e) {
