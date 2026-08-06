@@ -66,6 +66,7 @@ export async function POST(req: Request) {
       selectedCards?: InsightCard[];
       selectedFoods?: InsightCard[];
       harmony?: HarmonyResult;
+      isCustomCanvas?: boolean;
     };
     console.log("[trips] body received:", {
       destination: body.destination,
@@ -134,7 +135,12 @@ export async function POST(req: Request) {
       }
 
       const rawUserText = body.rawUserText?.trim() || undefined;
-      const prompt = tripPrompt(destination, enrichedTags, selectedCards, rawUserText, autoHarmony, drivingRoute);
+      // 自定义画布：显式指定，或未选任何卡片时自动转为画布模式（不让用户卡死）
+      const isCustomCanvas = body.isCustomCanvas === true || selectedCards.length === 0;
+      if (isCustomCanvas) {
+        console.log("[trips] 🎨 自定义画布模式: 只生成骨架(交通+酒店+placeholder)");
+      }
+      const prompt = tripPrompt(destination, enrichedTags, selectedCards, rawUserText, autoHarmony, drivingRoute, isCustomCanvas);
       console.log("[trips] calling ollamaJson, prompt length:", prompt.length);
       generated = await ollamaJson<TripGenerateResponse>(prompt);
       console.log("[trips] ollamaJson success, days:", generated.days?.length);

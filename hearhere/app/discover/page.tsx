@@ -50,7 +50,7 @@ const CUISINE_CHIPS = [
 
 export default function DiscoverPage() {
   const router = useRouter();
-  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard } = useSessionStore();
+  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript } = useSessionStore();
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
     attraction: [], food: [], souvenir: [], hotel: [],
@@ -64,6 +64,33 @@ export default function DiscoverPage() {
   const [cuisine, setCuisine] = useState("");
   // 选择数量校验
   const [showInsufficientWarning, setShowInsufficientWarning] = useState(false);
+  const [canvasCreating, setCanvasCreating] = useState(false);
+
+  // ── 🎨 自定义画布：推荐为空/不满意时的逃生舱，绝不卡死用户 ──
+  const handleCustomCanvas = async () => {
+    if (!tags?.destination || canvasCreating) return;
+    setCanvasCreating(true);
+    try {
+      const res = await fetch("/api/trips", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          destination: tags.destination,
+          tags,
+          rawUserText: transcript,
+          selectedCards: [],
+          selectedFoods: [],
+          isCustomCanvas: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "创建失败");
+      router.push(`/trip/${data.trip.id}`);
+    } catch (e) {
+      console.warn("[discover] custom canvas failed:", e);
+      setCanvasCreating(false);
+    }
+  };
 
   const destination = tags?.destination || "";
 
@@ -299,12 +326,28 @@ export default function DiscoverPage() {
             ))}
           </div>
         ) : currentCards.length === 0 ? (
-          <GlassCard className="py-10 text-center">
+          <GlassCard className="py-8 px-5 text-center">
             <div className="w-12 h-12 rounded-full bg-vibe-dusk/10 flex items-center justify-center mx-auto mb-3">
               <Sparkles className="w-5 h-5 text-vibe-dusk/40" />
             </div>
-            <p className="text-sm text-muted">暂无推荐</p>
-            <p className="text-xs text-muted/50 mt-1">换个筛选条件试试</p>
+            <p className="text-sm font-medium text-charcoal/80">没有找到心仪的推荐？</p>
+            <p className="text-sm font-medium text-charcoal/80">试试开启「自定义画布」</p>
+            <p className="text-xs text-muted/70 mt-2 leading-relaxed">
+              保留你的大交通和酒店，生成一张空白行程骨架，
+              <br />
+              由你亲手涂鸦每个时段。
+            </p>
+            <button
+              onClick={handleCustomCanvas}
+              disabled={canvasCreating}
+              className="mt-4 inline-flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium shadow-md active:scale-[0.97] transition-transform disabled:opacity-60"
+            >
+              {canvasCreating ? (
+                <>正在为你搭建画布…</>
+              ) : (
+                <>🎨 一键开启自定义画布，直接去排程</>
+              )}
+            </button>
           </GlassCard>
         ) : (
           <AnimatePresence mode="wait">

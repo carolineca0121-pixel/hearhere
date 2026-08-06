@@ -76,6 +76,9 @@ export default function TripPage() {
   const [adjustText, setAdjustText] = useState("");
   const [expandedDays, setExpandedDays] = useState<Set<number>>(new Set([1]));
   const [thoughtExpanded, setThoughtExpanded] = useState(true);
+  // 🎨 自定义画布：placeholder 占位卡的内联编辑
+  const [activePlaceholder, setActivePlaceholder] = useState<string | null>(null);
+  const [placeholderText, setPlaceholderText] = useState("");
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
   const [sharing, setSharing] = useState(false);
@@ -528,6 +531,53 @@ export default function TripPage() {
                               const isTransport = item.source === "transport";
                               const isSelected = item.source === "selected_card";
                               const isRest = item.source === "rest";
+
+                              // ── 🎨 自定义画布占位卡：虚线、可点击补充活动 ──
+                              if (item.source === "placeholder") {
+                                const phKey = `${day.dayIndex}-${i}`;
+                                const submitPlaceholder = () => {
+                                  if (!placeholderText.trim() || adjusting) return;
+                                  handleVoiceAdjust(
+                                    `把第${day.dayIndex}天 ${item.time} 的空白时段安排为：${placeholderText.trim()}`
+                                  );
+                                  setActivePlaceholder(null);
+                                  setPlaceholderText("");
+                                };
+                                return (
+                                  <div key={i} className="py-2">
+                                    {activePlaceholder === phKey ? (
+                                      <div className="flex gap-2 items-center rounded-xl border-2 border-dashed border-vibe-dusk/50 bg-white/60 px-3 py-2.5">
+                                        <input
+                                          autoFocus
+                                          value={placeholderText}
+                                          onChange={(e) => setPlaceholderText(e.target.value)}
+                                          onKeyDown={(e) => { if (e.key === "Enter") submitPlaceholder(); }}
+                                          placeholder="想安排什么？如：找家湖边咖啡馆发呆"
+                                          className="flex-1 bg-transparent text-sm text-charcoal outline-none placeholder:text-muted/50"
+                                        />
+                                        <button
+                                          onClick={submitPlaceholder}
+                                          disabled={adjusting || !placeholderText.trim()}
+                                          className="shrink-0 text-xs text-white bg-gradient-to-r from-vibe-sea to-vibe-dusk rounded-lg px-3 py-1.5 disabled:opacity-50"
+                                        >
+                                          {adjusting ? "安排中…" : "确认"}
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <button
+                                        onClick={() => { setActivePlaceholder(phKey); setPlaceholderText(""); }}
+                                        className="w-full rounded-xl border-2 border-dashed border-vibe-dusk/30 bg-white/30 py-3.5 px-3 flex items-center justify-center gap-2 text-sm text-vibe-dusk/60 hover:bg-white/50 hover:border-vibe-dusk/50 transition-colors"
+                                      >
+                                        <Plus className="w-4 h-4" />
+                                        <span>添加活动</span>
+                                        <span className="text-xs text-muted/50">
+                                          {item.period || item.time} · 这个时段由你决定
+                                        </span>
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              }
 
                               return (
                                 <div key={i} className="relative flex gap-3 py-3 border-b border-charcoal/5 last:border-0">

@@ -176,7 +176,8 @@ export function tripPrompt(
   cards: InsightCard[],
   rawUserText?: string,
   harmony?: HarmonyResult,
-  drivingRoute?: { distanceKm: number; durationHours: number; durationText: string; tolls?: number; serviceAreas: string[] } | null
+  drivingRoute?: { distanceKm: number; durationHours: number; durationText: string; tolls?: number; serviceAreas: string[] } | null,
+  isCustomCanvas?: boolean
 ): string {
   const hasCards = cards.length > 0;
   const cardTitles = cards.map((c) => c.title);
@@ -205,6 +206,69 @@ export function tripPrompt(
   const travelEstimate = departure
     ? estimateTravelTime(departure, destination, transportation)
     : null;
+
+  // ── 🎨 自定义画布模式：只生成物理骨架（交通+酒店+占位），绝不编造景点 ──
+  if (isCustomCanvas) {
+    const travelLabel = travelEstimate?.label || "前往目的地";
+    const travelHours = travelEstimate?.hours || 2;
+    const realDuration = drivingRoute?.durationText || travelLabel;
+    const realHours = drivingRoute?.durationHours || travelHours;
+    const goItem = departure
+      ? `Day 1 第一个 item 必须是路途「${departure}${transportation || "前往"}${destination}」：time "${String(departureHour).padStart(2, "0")}:00"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
+      : `Day 1 无需路途项，直接从酒店/第一个占位开始`;
+    const returnItem = departure
+      ? `最后一天（Day ${dayCount}）最后一个 item 必须是返程「${destination}${transportation || ""}返回${departure}」：time "${String(returnHour).padStart(2, "0")}:00"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
+      : `最后一天无需返程项`;
+
+    return `你是 HearHere 行程规划师。用户明确选择了「自定义画布」模式：他们不要你推荐任何景点或餐厅，只需要一个物理骨架（大交通+酒店入住+留白占位），其余内容由用户亲手填充。
+
+根据以下信息生成一份 ${dayCount} 天的【空白画布行程】。仅输出 JSON，不要其他文字。
+
+JSON 格式：
+{
+  "planningThought": "用大白话说明：这是用户选择的自定义画布，你已为他们锁定了往返交通和酒店入住，留白时段交给用户自己决定。如果原始语音里提到了具体酒店/车次，在这里点明你已经接收到了这些信息。",
+  "title": "标题，如「${destination}${dayCount}日自定义画布：骨架搭好，等你涂鸦」",
+  "vibeTheme": "sea|forest|dusk",
+  "overview": "一两句温暖的说明：交通和住宿已帮你安排好，剩下的空白由你亲手填充",
+  "travelTips": ["贴士1", "贴士2", "贴士3"],
+  "omittedSpots": [],
+  "days": [
+    {
+      "dayIndex": 1,
+      "items": [
+        {
+          "time": "09:00",
+          "activity": "地点或 [ ➕ 添加活动 ]",
+          "note": "一句话说明",
+          "duration": "预计停留时长",
+          "transport": "交通方式与时长",
+          "cost": "人均消费参考",
+          "tips": "实用提醒",
+          "source": "transport|rest|placeholder",
+          "recommendedDish": ""
+        }
+      ]
+    }
+  ]
+}
+
+【骨架规则（严格遵守）】
+1. ${goItem}
+2. Day 1 中午（到达后）安排酒店办理入住：source="rest"，activity="酒店办理入住"，note 提醒放行李、稍作休整。如果用户原始语音里提到了具体酒店名，activity 直接用该酒店名。
+3. 每天其余时段一律输出占位项：source="placeholder"，activity 固定为 "[ ➕ 添加活动 ]"，
+   time 按合理节奏分布（上午 09:00、中午 12:00、下午 14:00、傍晚 16:00、晚上 19:00 中选取），
+   note 写一句温暖的引导语（每天换说法），如「这个时段交给你，塞一家咖啡馆或想去的景点都行」。
+   每天 2-3 个 placeholder，不超过 3 个。
+4. ${returnItem}
+5. 最后一天上午保留 1 个 placeholder，note 提示「退房前还可以在附近走走」。
+6. 【绝对禁止】编造任何具体景点、餐厅、店名！除了路途和酒店入住，不允许出现任何真实地名或店名。
+7. planningThought 必须体现：你识别到了原始语音中的哪些确定信息（交通时间/酒店/人数），以及你为什么这样排布骨架。
+
+目的地：${destination}
+用户原始语音（最高信息源）：「${rawUserText?.trim() || "未提供，以结构化偏好为准"}」
+结构化偏好：${JSON.stringify(tags)}
+出发信息：出发地=${departure || "未知"}，交通=${transportation || "未指定"}，出发时间=${departureTimeLabel}（${String(departureHour).padStart(2, "0")}:00），返程偏好=${returnTimeLabel}（${String(returnHour).padStart(2, "0")}:00）`;
+  }
 
   const cardHint = hasCards
     ? `【愿望清单断舍离机制（极其重要）】用户已通过滑卡选择了以下 ${cards.length} 个地点，这是用户的「愿望清单」：
