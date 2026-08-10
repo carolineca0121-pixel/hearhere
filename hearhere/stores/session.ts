@@ -16,6 +16,7 @@ interface SessionState {
   tags: ExtractedTags | null;
   harmony: HarmonyResult | null;
   screenshotPlaces: string[];   // 📷 截图 OCR 识别出的地名列表
+  pendingImages: string[];      // 📷 暂存的截图 base64（路径C：Page1暂存→Page2统一识别）
   insightCards: InsightCard[];
   selectedCards: InsightCard[];
   foodCards: InsightCard[];
@@ -32,6 +33,7 @@ interface SessionState {
   setTags: (tags: ExtractedTags | null) => void;
   setHarmony: (h: HarmonyResult | null) => void;
   setScreenshotPlaces: (places: string[]) => void;
+  setPendingImages: (images: string[]) => void;
   setInsightCards: (cards: InsightCard[]) => void;
   addSelectedCard: (card: InsightCard) => void;
   removeSelectedCard: (id: string) => void;
@@ -94,6 +96,7 @@ export const useSessionStore = create<SessionState>()(
       tags: null,
       harmony: null,
       screenshotPlaces: [],
+      pendingImages: [],
       insightCards: [],
       selectedCards: [],
       foodCards: [],
@@ -117,6 +120,7 @@ export const useSessionStore = create<SessionState>()(
       },
       setHarmony: (harmony) => set({ harmony }),
       setScreenshotPlaces: (screenshotPlaces) => set({ screenshotPlaces }),
+      setPendingImages: (pendingImages) => set({ pendingImages }),
       setInsightCards: (insightCards) => set({ insightCards }),
       addSelectedCard: (card) =>
         set((s) => ({
@@ -209,6 +213,7 @@ export const useSessionStore = create<SessionState>()(
           tags: null,
           harmony: null,
           screenshotPlaces: [],
+          pendingImages: [],
           insightCards: [],
           selectedCards: [],
           foodCards: [],

@@ -51,7 +51,7 @@ const CUISINE_CHIPS = [
 
 export default function DiscoverPage() {
   const router = useRouter();
-  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces } = useSessionStore();
+  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces, reset } = useSessionStore();
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
     attraction: [], food: [], souvenir: [], hotel: [],
@@ -91,6 +91,7 @@ export default function DiscoverPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "创建失败");
+      reset(); // 🧹 行程已生成并落库，静默清空本地草稿
       router.push(`/trip/${data.trip.id}`);
     } catch (e) {
       console.warn("[discover] custom canvas failed:", e);

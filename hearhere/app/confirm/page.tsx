@@ -221,8 +221,13 @@ export default function ConfirmPage() {
     setRefinedTranscript,
     setTags,
     reset,
+    pendingImages,
+    setPendingImages,
+    screenshotPlaces,
+    setScreenshotPlaces,
   } = useSessionStore();
   const [loading, setLoading] = useState(false);
+  const [planning, setPlanning] = useState(false);
   const [reExtracting, setReExtracting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
@@ -360,6 +365,50 @@ export default function ConfirmPage() {
 
   const goNext = () => router.push("/discover");
 
+  // ── 路径C：开始智能规划 —— 并发识别暂存截图（Promise.all，严禁排队），合并后进入 Page 3 ──
+  const handleSmartPlan = async () => {
+    if (planning) return;
+    setPlanning(true);
+    setError(null);
+    try {
+      const results = await Promise.all(
+        pendingImages.map(async (dataUrl) => {
+          const blob = await (await fetch(dataUrl)).blob();
+          const fd = new FormData();
+          fd.append("file", new File([blob], "shot.jpg", { type: "image/jpeg" }));
+          const res = await fetch("/api/extract-image", { method: "POST", body: fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error ?? "截图识别失败");
+          return data;
+        })
+      );
+      // 地名合并去重
+      const allPlaces = Array.from(
+        new Set(results.flatMap((r) => (r.mentionedPlaces ?? []) as string[]))
+      );
+      if (allPlaces.length > 0) {
+        setScreenshotPlaces(Array.from(new Set([...screenshotPlaces, ...allPlaces])));
+      }
+      // 用户没填目的地时，用 OCR 的 tags 补齐（用户手填的字段优先）
+      const ocrTags = results.map((r) => r.tags).find((t: any) => t?.destination);
+      if (ocrTags && !tags?.destination) {
+        const merged: any = { ...ocrTags };
+        for (const [k, v] of Object.entries(tags ?? {})) {
+          if (v !== undefined && v !== null && !(Array.isArray(v) && v.length === 0)) {
+            merged[k] = v;
+          }
+        }
+        setTags(merged);
+      }
+      setPendingImages([]);
+      router.push("/discover");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "截图识别失败，请重试");
+    } finally {
+      setPlanning(false);
+    }
+  };
+
   // 🆕 出发时间默认值映射
   const DEPARTURE_TIME_DEFAULTS: Record<string, string> = {
     "早上出发": "默认 9:00 出发",
@@ -379,6 +428,13 @@ export default function ConfirmPage() {
         <h1 className="text-xl font-semibold text-charcoal">我听到了这些</h1>
         <p className="text-sm text-muted">确认一下，也可以继续补充</p>
       </div>
+
+      {/* 📷 路径C：截图联合规划徽章 */}
+      {pendingImages.length > 0 && (
+        <div className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-green-100/80 border border-green-300/50 text-green-700 text-xs font-medium px-3.5 py-1.5">
+          📷 已载入 {pendingImages.length} 张上传的截图进行联合规划
+        </div>
+      )}
 
       {/* 需求文本区 */}
       <GlassCard>
@@ -415,6 +471,39 @@ export default function ConfirmPage() {
           className="w-full resize-none rounded-2xl border border-white/40 bg-white/70 px-3 py-2 text-sm leading-relaxed text-charcoal outline-none focus:border-vibe-dusk/40"
           placeholder="你可以在这里修改或补充文字"
         />
+
+        {/* 🎙️ 录音状态面板：脉冲微光 + 声波动画 + 显眼停止按钮 */}
+        {isRecording && (
+          <div className="mt-3 flex flex-col items-center gap-3 rounded-2xl bg-red-50/60 border border-red-200/50 px-4 py-4">
+            <style>{`
+              @keyframes hh-wave { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1); } }
+              .hh-wave-bar { animation: hh-wave 0.9s ease-in-out infinite; transform-origin: bottom; display: inline-block; height: 100%; }
+            `}</style>
+            <div className="relative">
+              <div className="absolute inset-0 rounded-full bg-red-400/40 animate-ping" />
+              <div className="relative w-12 h-12 rounded-full bg-gradient-to-br from-red-400 to-orange-400 flex items-center justify-center shadow-lg shadow-red-300/50">
+                <Mic className="w-5 h-5 text-white" />
+              </div>
+            </div>
+            <div className="flex items-end gap-1 h-6">
+              {[0, 1, 2, 3, 4].map((i) => (
+                <span
+                  key={i}
+                  className="hh-wave-bar w-1 rounded-full bg-gradient-to-t from-red-400 to-orange-400"
+                  style={{ animationDelay: `${i * 0.12}s` }}
+                />
+              ))}
+            </div>
+            <p className="text-xs text-red-500/80">正在聆听…说完点下面按钮</p>
+            <button
+              type="button"
+              onClick={stopAppendingRecording}
+              className="w-full py-3 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-400 text-white text-sm font-semibold shadow-md active:scale-[0.98] transition-transform"
+            >
+              🛑 我讲完了 / 停止录音
+            </button>
+          </div>
+        )}
 
         {showOriginal && transcript && (
           <p className="mt-2 rounded-2xl bg-white/40 px-3 py-2 text-xs leading-relaxed text-muted">
@@ -637,9 +726,22 @@ export default function ConfirmPage() {
         <Button variant="outline" size="sm" onClick={() => router.push("/")} disabled={loading}>
           返回重说
         </Button>
-        <Button onClick={goNext} disabled={loading}>
-          确认并继续
-        </Button>
+        {pendingImages.length > 0 ? (
+          <Button onClick={handleSmartPlan} disabled={loading || planning}>
+            {planning ? (
+              <span className="flex items-center gap-1.5">
+                <span className="w-3.5 h-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                正在并发识别 {pendingImages.length} 张截图…
+              </span>
+            ) : (
+              "开始智能规划"
+            )}
+          </Button>
+        ) : (
+          <Button onClick={goNext} disabled={loading}>
+            确认并继续
+          </Button>
+        )}
       </div>
     </div>
   );

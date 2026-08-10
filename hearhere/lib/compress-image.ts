@@ -7,7 +7,7 @@
  * 单张控制在 ~250-400KB，5 张总 payload < 1.5MB。
  */
 
-const MAX_DIMENSION = 1024;
+const MAX_DIMENSION = 800; // 兼顾 OCR 准确率与模型处理速度
 const JPEG_QUALITY = 0.8;
 
 export interface CompressedImage {
@@ -58,4 +58,14 @@ export async function compressImage(file: File): Promise<CompressedImage> {
 /** 释放预览 URL，避免内存泄漏 */
 export function revokePreview(img: CompressedImage): void {
   URL.revokeObjectURL(img.previewUrl);
+}
+
+/** Blob → base64 data URL（用于 Zustand 暂存截图，路径C） */
+export function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("图片读取失败"));
+    reader.readAsDataURL(blob);
+  });
 }

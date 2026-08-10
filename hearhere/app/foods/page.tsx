@@ -34,6 +34,7 @@ export default function FoodsPage() {
     setFoodCards,
     addSelectedFood,
     removeSelectedFood,
+    reset,
   } = useSessionStore();
   const [index, setIndex] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -111,6 +112,7 @@ export default function FoodsPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "创建失败");
       clearInterval(stageTimer);
+      reset(); // 🧹 行程已生成并落库，静默清空本地草稿（首页恢复清爽）
       router.push(`/trip/${data.trip.id}`);
     } catch (e) {
       clearInterval(stageTimer);

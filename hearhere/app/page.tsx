@@ -8,7 +8,7 @@ import { GlassCard } from "@/components/layout/glass-card";
 import { Button } from "@/components/ui/button";
 import { useSessionStore } from "@/stores/session";
 import { getMicErrorMessage } from "@/lib/mic";
-import { compressImage, revokePreview, type CompressedImage } from "@/lib/compress-image";
+import { compressImage, revokePreview, blobToDataUrl, type CompressedImage } from "@/lib/compress-image";
 import Link from "next/link";
 import {
   Sparkles,
@@ -43,7 +43,7 @@ const FLOW_STEPS = [
 export default function HomePage() {
   const router = useRouter();
   const { data: session, status } = useSession();
-  const { reset, setTranscript, setRefinedTranscript, setTags, setScreenshotPlaces, transcript, tags, screenshotPlaces } = useSessionStore();
+  const { reset, setTranscript, setRefinedTranscript, setTags, setScreenshotPlaces, transcript, tags, screenshotPlaces, pendingImages, setPendingImages, selectedContent } = useSessionStore();
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -180,37 +180,24 @@ export default function HomePage() {
       return;
     }
     setImageLoading(true);
-    setImageProgress(0);
     setError(null);
-    reset();
     try {
-      // 逐张识别，地名合并去重
-      const allPlaces = new Set<string>();
-      let lastTags: Parameters<typeof setTags>[0] = null;
-      for (let i = 0; i < images.length; i++) {
-        const fd = new FormData();
-        fd.append(
-          "file",
-          new File([images[i].blob], images[i].name || `shot-${i + 1}.jpg`, { type: "image/jpeg" })
-        );
-        const res = await fetch("/api/extract-image", { method: "POST", body: fd });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "图片识别失败");
-        (data.mentionedPlaces ?? []).forEach((p: string) => allPlaces.add(p));
-        if (data.tags) lastTags = data.tags;
-        setImageProgress(i + 1);
+      // 路径C：不立即识别、不跳 Page3 —— 压缩后暂存 base64 到全局 store，
+      // 进 Page 2 补充出行信息，点「开始智能规划」时统一并发识别
+      reset();
+      const dataUrls: string[] = [];
+      for (const img of images) {
+        dataUrls.push(await blobToDataUrl(img.blob));
       }
-
-      setTranscript("");
-      setRefinedTranscript("");
-      if (lastTags) setTags(lastTags);
-      setScreenshotPlaces(Array.from(allPlaces));
+      setPendingImages(dataUrls);
+      // confirm 页需要 tags 才放行：先给空 tags，让用户在 Page 2 补全
+      setTags({ preferences: [], constraints: [], conflicts: [] });
+      clearImages();
       router.push("/confirm");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "图片识别失败，请换一张试试");
+      setError(e instanceof Error ? e.message : "图片处理失败，请重试");
     } finally {
       setImageLoading(false);
-      setImageProgress(0);
     }
   };
 
@@ -447,10 +434,10 @@ export default function HomePage() {
                       {imageLoading ? (
                         <span className="flex items-center gap-1.5">
                           <span className="w-3 h-3 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-                          识别中 {imageProgress}/{images.length}…
+                          整理中…
                         </span>
                       ) : (
-                        "开始识别"
+                        "下一步：补充出行信息"
                       )}
                     </Button>
                     <Button
@@ -469,18 +456,30 @@ export default function HomePage() {
             )}
           </div>
 
-          {/* ========== 🧹 结束本次旅行，开启新规划（数据持久化配套） ========== */}
-          {(transcript || tags || screenshotPlaces.length > 0) && (
-            <div className="w-full flex justify-center mt-1">
-              <button
-                onClick={() => {
-                  clearImages();
-                  reset();
-                }}
-                className="text-xs text-muted/70 hover:text-charcoal underline underline-offset-4 decoration-muted/40 transition-colors"
-              >
-                🧹 结束本次旅行，开启新规划
-              </button>
+          {/* ========== 🔍 草稿检测：有未完成规划才提示，首页常态保持干净 ========== */}
+          {(transcript || tags?.destination || screenshotPlaces.length > 0 || pendingImages.length > 0 || selectedContent.length > 0) && (
+            <div className="w-full mt-1 rounded-2xl border border-amber-200/60 bg-amber-50/60 backdrop-blur-sm px-4 py-3">
+              <p className="text-xs text-amber-900/80 leading-relaxed text-center">
+                🔍 <span className="font-medium">系统提示：</span>
+                发现您有上一次未完成的旅行草稿，是否恢复？
+              </p>
+              <div className="flex gap-2 mt-2.5">
+                <button
+                  onClick={() => router.push(tags?.destination ? "/confirm" : selectedContent.length > 0 ? "/discover" : "/confirm")}
+                  className="flex-1 py-2 rounded-xl bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-xs font-medium"
+                >
+                  恢复草稿继续
+                </button>
+                <button
+                  onClick={() => {
+                    clearImages();
+                    reset();
+                  }}
+                  className="flex-1 py-2 rounded-xl border border-amber-300/60 text-amber-800/80 text-xs hover:bg-amber-100/50 transition-colors"
+                >
+                  🧹 舍弃并开启新规划
+                </button>
+              </div>
             </div>
           )}
         </motion.div>

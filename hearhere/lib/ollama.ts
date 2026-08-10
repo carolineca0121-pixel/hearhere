@@ -209,7 +209,7 @@ export async function ollamaChat(
 // ── 视觉模型（截图提取行程） ──────────────────────────
 
 const SILICONFLOW_VISION_MODEL =
-  process.env.SILICONFLOW_VISION_MODEL ?? "Qwen/Qwen3-VL-32B-Instruct";
+  process.env.SILICONFLOW_VISION_MODEL ?? "Qwen/Qwen3-VL-8B-Instruct"; // 轻量快速（Qwen2.5-VL全系已被硅基流动下架，实测不可用）
 const DEEPSEEK_VISION_MODEL =
   process.env.DEEPSEEK_VISION_MODEL ?? "deepseek-vl2";
 

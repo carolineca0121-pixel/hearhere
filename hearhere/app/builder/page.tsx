@@ -32,6 +32,7 @@ export default function BuilderPage() {
     selectedFoods,
     addSelectedFood,
     transcript,
+    reset,
   } = useSessionStore();
   const [isAutoGenerating, setIsAutoGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -157,6 +158,7 @@ export default function BuilderPage() {
       }
 
       const data = await res.json();
+      reset(); // 🧹 行程已生成并落库，静默清空本地草稿（首页恢复清爽）
       router.push(`/trip/${data.trip.id}`);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : "生成攻略失败，请重试");
