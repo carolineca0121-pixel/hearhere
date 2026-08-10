@@ -254,6 +254,13 @@ export default function ConfirmPage() {
   if (!_hydrated) return null;
   if (!tags) return null;
 
+  // 结构化标签区是否有内容（路径C空 tags 时为 false，避免渲染空白白盒子）
+  const hasStructuredTags = Boolean(
+    tags.tripType || tags.peopleCount || tags.transportation ||
+    tags.departure || tags.destination || tags.days || tags.dates ||
+    tags.preferences.length > 0 || tags.constraints.length > 0
+  );
+
   const updateTags = (next: ExtractedTags) => setTags(next);
 
   // 快速补全：点击 chip 直接更新 tag
@@ -500,7 +507,7 @@ export default function ConfirmPage() {
               onClick={stopAppendingRecording}
               className="w-full py-3 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-400 text-white text-sm font-semibold shadow-md active:scale-[0.98] transition-transform"
             >
-              🛑 我讲完了 / 停止录音
+              🛑 我讲完了
             </button>
           </div>
         )}
@@ -546,9 +553,11 @@ export default function ConfirmPage() {
 
       {/* 结构化标签 + 信息完备度 */}
       <LayoutGroup>
-        <GlassCard>
-          <StructuredTags tags={tags} />
-        </GlassCard>
+        {hasStructuredTags && (
+          <GlassCard>
+            <StructuredTags tags={tags} />
+          </GlassCard>
+        )}
 
         {missingFields.length > 0 && (
           <GlassCard>
