@@ -8,6 +8,7 @@ import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/m
 import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
 import { useSessionStore } from "@/stores/session";
+import { compressImage } from "@/lib/compress-image";
 
 type DiscoverCategory = "attraction" | "food" | "souvenir" | "hotel";
 
@@ -50,7 +51,7 @@ const CUISINE_CHIPS = [
 
 export default function DiscoverPage() {
   const router = useRouter();
-  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces } = useSessionStore();
+  const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces } = useSessionStore();
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
     attraction: [], food: [], souvenir: [], hotel: [],
@@ -58,8 +59,11 @@ export default function DiscoverPage() {
   const [loading, setLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const poiCoordsRef = useRef<Map<string, { lng: number; lat: number }>>(new Map());
-  // 📷 截图地名只自动加入一次（用户手动移除后不强行加回）
-  const shotAutoAddedRef = useRef(false);
+  // 📷 用户手动移除的截图地名（不强行加回）；新增地名会自动蹦入
+  const dismissedShotsRef = useRef<Set<string>>(new Set());
+  // 📷 追加上传截图
+  const shotFileRef = useRef<HTMLInputElement | null>(null);
+  const [shotAppending, setShotAppending] = useState(false);
 
   // 美食筛选
   const [mealType, setMealType] = useState("");
@@ -162,12 +166,12 @@ export default function DiscoverPage() {
 
   useEffect(() => { setSelectedIds(new Set(selectedContent.map((c) => c.id))); }, [selectedContent]);
 
-  // 📷 截图 OCR 联动：识别出的地名默认作为已选卡片置顶
+  // 📷 截图 OCR 联动：识别出的地名默认作为已选卡片置顶；追加上传的地名会自动蹦入
   useEffect(() => {
-    if (!_hydrated || shotAutoAddedRef.current || screenshotPlaces.length === 0) return;
-    shotAutoAddedRef.current = true;
+    if (!_hydrated || screenshotPlaces.length === 0) return;
     for (const name of screenshotPlaces) {
       const id = `shot-${name}`;
+      if (dismissedShotsRef.current.has(name)) continue;
       if (selectedContent.some((c) => c.id === id)) continue;
       addContentCard({
         id,
@@ -184,8 +188,10 @@ export default function DiscoverPage() {
   const handleShotToggle = (name: string) => {
     const id = `shot-${name}`;
     if (selectedContent.some((c) => c.id === id)) {
+      dismissedShotsRef.current.add(name);
       removeContentCard(id);
     } else {
+      dismissedShotsRef.current.delete(name);
       addContentCard({
         id,
         title: name,
@@ -194,6 +200,30 @@ export default function DiscoverPage() {
         category: "attraction",
         status: "selected",
       });
+    }
+  };
+
+  // 📷 增量追加：在 Page 3 直接上传新截图，识别地名合并去重后自动蹦入卡片
+  const handleShotAppend = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || shotAppending) return;
+    setShotAppending(true);
+    try {
+      const compressed = await compressImage(file);
+      const fd = new FormData();
+      fd.append("file", new File([compressed.blob], file.name || "shot.jpg", { type: "image/jpeg" }));
+      const res = await fetch("/api/extract-image", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "识别失败");
+      const newPlaces: string[] = data.mentionedPlaces ?? [];
+      if (newPlaces.length > 0) {
+        setScreenshotPlaces(Array.from(new Set([...screenshotPlaces, ...newPlaces])));
+      }
+    } catch (err) {
+      console.warn("[discover] shot append failed:", err);
+    } finally {
+      setShotAppending(false);
+      if (shotFileRef.current) shotFileRef.current.value = "";
     }
   };
 
@@ -295,8 +325,31 @@ export default function DiscoverPage() {
                   </button>
                 );
               })}
+              <button
+                onClick={() => shotFileRef.current?.click()}
+                disabled={shotAppending}
+                className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs border border-dashed border-vibe-dusk/40 text-vibe-dusk/70 hover:bg-white/60 transition-colors disabled:opacity-50"
+              >
+                {shotAppending ? "识别中…" : "➕ 追加上传攻略截图"}
+              </button>
             </div>
+            <input
+              ref={shotFileRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={handleShotAppend}
+            />
           </GlassCard>
+        </div>
+      )}
+
+      {/* ── 🛎️ 数据守护横幅 ── */}
+      {(transcript || screenshotPlaces.length > 0) && (
+        <div className="px-4 mt-2">
+          <p className="text-[11px] text-muted/70 text-center leading-relaxed">
+            🛎️ 旅行管家：您之前导入的截图和语音已安全存入本地，随时可以返回首页追加新想法，我们为您守护数据。
+          </p>
         </div>
       )}
 

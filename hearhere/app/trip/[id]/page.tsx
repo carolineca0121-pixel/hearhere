@@ -402,7 +402,7 @@ export default function TripPage() {
                   >
                     <div className="border-t border-amber-200/40">
                       <p className="px-4 pt-2.5 text-[11px] text-amber-700/60">
-                        本方案的设计考量与细节提示
+                        设计细节与避坑考量
                       </p>
                       <p className="px-4 pb-4 pt-1.5 text-sm italic leading-relaxed text-amber-900/70">
                         {planningThought}
@@ -414,6 +414,13 @@ export default function TripPage() {
             </motion.div>
           </div>
         )}
+
+        {/* ── 🛎️ 数据守护横幅 ── */}
+        <div className="px-4 pt-3">
+          <p className="text-[11px] text-muted/70 text-center leading-relaxed">
+            🛎️ 旅行管家：您之前导入的截图和语音已安全存入本地，随时可以返回首页追加新想法，我们为您守护数据。
+          </p>
+        </div>
 
         {/* ── 天气条 ── */}
         {weather && (weather.live || weather.forecasts.length > 0) && (

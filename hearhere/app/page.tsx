@@ -8,6 +8,7 @@ import { GlassCard } from "@/components/layout/glass-card";
 import { Button } from "@/components/ui/button";
 import { useSessionStore } from "@/stores/session";
 import { getMicErrorMessage } from "@/lib/mic";
+import { compressImage, revokePreview, type CompressedImage } from "@/lib/compress-image";
 import Link from "next/link";
 import {
   Sparkles,
@@ -42,15 +43,15 @@ const FLOW_STEPS = [
 export default function HomePage() {
   const router = useRouter();
   const { data: session, status } = useSession();
-  const { reset, setTranscript, setRefinedTranscript, setTags, setScreenshotPlaces } = useSessionStore();
+  const { reset, setTranscript, setRefinedTranscript, setTags, setScreenshotPlaces, transcript, tags, screenshotPlaces } = useSessionStore();
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exampleIndex, setExampleIndex] = useState(0);
   const [activeQuickDest, setActiveQuickDest] = useState<string | null>(null);
-  // 截图创建行程
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [imageFile, setImageFile] = useState<File | null>(null);
+  // 截图创建行程（多图，最多 5 张）
+  const [images, setImages] = useState<(CompressedImage & { name: string })[]>([]);
+  const [imageProgress, setImageProgress] = useState(0);
   const [imageLoading, setImageLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRef = useRef<MediaRecorder | null>(null);
@@ -141,47 +142,75 @@ export default function HomePage() {
 
   // ── 截图创建行程 ──────────────────────────────────
 
-  const handleImagePick = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const handleImagePick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []).slice(0, 5 - images.length);
+    if (files.length === 0) return;
     setError(null);
-    setImageFile(file);
-    const reader = new FileReader();
-    reader.onload = () => setImagePreview(reader.result as string);
-    reader.readAsDataURL(file);
+    try {
+      for (const file of files) {
+        // 🛡️ 客户端压缩：防 Vercel 4.5MB 请求体上限崩溃
+        const compressed = await compressImage(file);
+        setImages((prev) => [...prev, { name: file.name, ...compressed }].slice(0, 5));
+      }
+    } catch {
+      setError("图片处理失败，请换一张试试");
+    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const clearImage = () => {
-    setImageFile(null);
-    setImagePreview(null);
+  const removeImage = (index: number) => {
+    setImages((prev) => {
+      const next = [...prev];
+      const [removed] = next.splice(index, 1);
+      if (removed) revokePreview(removed);
+      return next;
+    });
+  };
+
+  const clearImages = () => {
+    images.forEach(revokePreview);
+    setImages([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const processImage = async () => {
-    if (!imageFile) return;
+    if (images.length === 0) return;
     if (!session?.user) {
       router.push("/login");
       return;
     }
     setImageLoading(true);
+    setImageProgress(0);
     setError(null);
     reset();
     try {
-      const fd = new FormData();
-      fd.append("file", imageFile);
-      const res = await fetch("/api/extract-image", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "图片识别失败");
+      // 逐张识别，地名合并去重
+      const allPlaces = new Set<string>();
+      let lastTags: Parameters<typeof setTags>[0] = null;
+      for (let i = 0; i < images.length; i++) {
+        const fd = new FormData();
+        fd.append(
+          "file",
+          new File([images[i].blob], images[i].name || `shot-${i + 1}.jpg`, { type: "image/jpeg" })
+        );
+        const res = await fetch("/api/extract-image", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "图片识别失败");
+        (data.mentionedPlaces ?? []).forEach((p: string) => allPlaces.add(p));
+        if (data.tags) lastTags = data.tags;
+        setImageProgress(i + 1);
+      }
 
       setTranscript("");
       setRefinedTranscript("");
-      setTags(data.tags);
-      setScreenshotPlaces(data.mentionedPlaces ?? []);
+      if (lastTags) setTags(lastTags);
+      setScreenshotPlaces(Array.from(allPlaces));
       router.push("/confirm");
     } catch (e) {
       setError(e instanceof Error ? e.message : "图片识别失败，请换一张试试");
     } finally {
       setImageLoading(false);
+      setImageProgress(0);
     }
   };
 
@@ -349,10 +378,11 @@ export default function HomePage() {
               ref={fileInputRef}
               type="file"
               accept="image/jpeg,image/png,image/webp"
+              multiple
               className="hidden"
               onChange={handleImagePick}
             />
-            {!imagePreview ? (
+            {images.length === 0 ? (
               <motion.button
                 whileTap={{ scale: 0.98 }}
                 onClick={() => fileInputRef.current?.click()}
@@ -372,54 +402,87 @@ export default function HomePage() {
               </motion.button>
             ) : (
               <GlassCard className="w-full">
-                <div className="flex items-start gap-3">
-                  <div className="relative w-16 h-16 rounded-xl overflow-hidden shrink-0 border border-white/60">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={imagePreview}
-                      alt="截图预览"
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-charcoal/90 truncate">
-                      {imageFile?.name ?? "已选择截图"}
-                    </p>
-                    <p className="text-xs text-muted/60 mt-0.5">
-                      识别图片中的目的地、天数、偏好
-                    </p>
-                    <div className="flex gap-2 mt-2.5">
-                      <Button
-                        size="sm"
-                        onClick={processImage}
+                <div className="flex flex-wrap gap-2 mb-3">
+                  {images.map((img, i) => (
+                    <div
+                      key={img.previewUrl}
+                      className="relative w-16 h-16 rounded-xl overflow-hidden shrink-0 border border-white/60"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={img.previewUrl}
+                        alt={`截图${i + 1}`}
+                        className="w-full h-full object-cover"
+                      />
+                      <button
+                        onClick={() => removeImage(i)}
                         disabled={imageLoading}
-                        className="h-8 text-xs"
+                        className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-black/50 text-white flex items-center justify-center"
                       >
-                        {imageLoading ? (
-                          <span className="flex items-center gap-1.5">
-                            <span className="w-3 h-3 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-                            识别中…
-                          </span>
-                        ) : (
-                          "开始识别"
-                        )}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={clearImage}
-                        disabled={imageLoading}
-                        className="h-8 text-xs text-muted"
-                      >
-                        <X className="w-3 h-3 mr-0.5" />
-                        换一张
-                      </Button>
+                        <X className="w-2.5 h-2.5" />
+                      </button>
                     </div>
+                  ))}
+                  {images.length < 5 && (
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={imageLoading}
+                      className="w-16 h-16 rounded-xl border-2 border-dashed border-vibe-dusk/25 flex items-center justify-center text-vibe-dusk/50 hover:bg-white/60 transition-colors"
+                    >
+                      <ImagePlus className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-muted/60">
+                    已选 {images.length}/5 张 · 自动压缩防超限
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={processImage}
+                      disabled={imageLoading}
+                      className="h-8 text-xs"
+                    >
+                      {imageLoading ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="w-3 h-3 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                          识别中 {imageProgress}/{images.length}…
+                        </span>
+                      ) : (
+                        "开始识别"
+                      )}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={clearImages}
+                      disabled={imageLoading}
+                      className="h-8 text-xs text-muted"
+                    >
+                      <X className="w-3 h-3 mr-0.5" />
+                      清空
+                    </Button>
                   </div>
                 </div>
               </GlassCard>
             )}
           </div>
+
+          {/* ========== 🧹 结束本次旅行，开启新规划（数据持久化配套） ========== */}
+          {(transcript || tags || screenshotPlaces.length > 0) && (
+            <div className="w-full flex justify-center mt-1">
+              <button
+                onClick={() => {
+                  clearImages();
+                  reset();
+                }}
+                className="text-xs text-muted/70 hover:text-charcoal underline underline-offset-4 decoration-muted/40 transition-colors"
+              >
+                🧹 结束本次旅行，开启新规划
+              </button>
+            </div>
+          )}
         </motion.div>
       )}
 
