@@ -295,6 +295,23 @@ JSON 格式：
 安排原则：寺庙/景区放上午，海边/日落放傍晚，街区/夜市放晚上，美食放午餐或晚餐时间。`
     : `用户没有手动选择任何卡片。请根据【偏好】和【目的地】自行为用户构想合理的活动安排（包括知名景点、餐饮、休憩、夜景等），不要留空。`;
 
+  // 🧩 场景二·截图填空题：用户只精选了少量卡片（少于 天数×2），意图是「只去这些地方，别塞别的」
+  const isSparseSelection = hasCards && cards.length < dayCount * 2;
+  const sparseHint = isSparseSelection
+    ? `
+【🧩 精选模式（优先级最高，覆盖下方所有「活动数量/补充推荐」类要求）】
+用户只精选了 ${cards.length} 个心仪地点，主动放弃了其他所有 AI 推荐——这是用户的明确意图，请尊重：
+1. 这 ${cards.length} 个地点全部排入最合理的时段（按地理顺路 + 最佳游览时间），source 标 "selected_card"。
+2. 【严禁】为了凑满每天的活动数量而编造任何其他景点/网红地！
+3. 除路途、酒店入住、用户精选地点、一日三餐（餐饮可正常推荐真实餐厅）外，其余空出的时段必须输出 source="placeholder" 的占位项：
+   - activity 固定为 "[ ➕ 添加活动 ]"
+   - time 按合理节奏分布在上午/下午/晚上
+   - note 写一句温暖的留白引导，如「这个时段交给你，可以临时起意」
+   - 每天真实活动（不含餐饮/交通/休息）可以只有 1-2 个，留白是特性不是缺陷
+4. 断舍离机制在精选模式下不适用——用户精选的地点一个都不许舍弃（omittedSpots 输出空数组 []）。
+`
+    : "";
+
   // 根据人群定制推荐风格
   let crowdStyle = "";
   if (/父母|爸妈|老人|长辈/.test(tags.preferences.join("") + (tags.dates || ""))) {
@@ -450,6 +467,7 @@ JSON 格式：
 - 最后一天返程活动的 time 必须精确等于 ${retTimeStr}，当天上午活动与午餐必须在此时间之前结束，并留出去车站/机场的余量。
 偏好：${JSON.stringify(tags)}
 ${cardHint}
+${sparseHint}
 ${travelInstruction}
 ${crowdStyle}
 ${destinationExamples}

@@ -210,21 +210,24 @@ export default function DiscoverPage() {
     }
   };
 
-  // 📷 增量追加：在 Page 3 直接上传新截图，识别地名合并去重后自动蹦入卡片
-  const handleShotAppend = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || shotAppending) return;
+  // 📷 增量追加：在 Page 3 直接上传新截图（支持多选/拖拽），识别地名合并去重后自动蹦入卡片
+  const processShotFiles = async (files: File[]) => {
+    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+    if (imageFiles.length === 0 || shotAppending) return;
     setShotAppending(true);
     try {
-      const compressed = await compressImage(file);
-      const fd = new FormData();
-      fd.append("file", new File([compressed.blob], file.name || "shot.jpg", { type: "image/jpeg" }));
-      const res = await fetch("/api/extract-image", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "识别失败");
-      const newPlaces: string[] = data.mentionedPlaces ?? [];
-      if (newPlaces.length > 0) {
-        setScreenshotPlaces(Array.from(new Set([...screenshotPlaces, ...newPlaces])));
+      const collected: string[] = [];
+      for (const file of imageFiles) {
+        const compressed = await compressImage(file);
+        const fd = new FormData();
+        fd.append("file", new File([compressed.blob], file.name || "shot.jpg", { type: "image/jpeg" }));
+        const res = await fetch("/api/extract-image", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "识别失败");
+        (data.mentionedPlaces ?? []).forEach((p: string) => collected.push(p));
+      }
+      if (collected.length > 0) {
+        setScreenshotPlaces(Array.from(new Set([...screenshotPlaces, ...collected])));
       }
     } catch (err) {
       console.warn("[discover] shot append failed:", err);
@@ -232,6 +235,15 @@ export default function DiscoverPage() {
       setShotAppending(false);
       if (shotFileRef.current) shotFileRef.current.value = "";
     }
+  };
+
+  const handleShotAppend = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    await processShotFiles(Array.from(e.target.files ?? []));
+  };
+
+  const handleShotDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    await processShotFiles(Array.from(e.dataTransfer.files));
   };
 
   const handleToggle = (card: PoiCardData) => {
@@ -340,16 +352,19 @@ export default function DiscoverPage() {
                 {shotAppending ? "识别中…" : "➕ 追加上传攻略截图"}
               </button>
             </div>
-            <input
-              ref={shotFileRef}
-              type="file"
-              accept="image/jpeg,image/png,image/webp"
-              className="hidden"
-              onChange={handleShotAppend}
-            />
           </GlassCard>
         </div>
       )}
+
+      {/* 截图上传隐藏 input（常驻，供追加按钮与白屏 Dropzone 共用） */}
+      <input
+        ref={shotFileRef}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleShotAppend}
+      />
 
       {/* ── 🛎️ 数据守护横幅 ── */}
       {(transcript || screenshotPlaces.length > 0) && (
@@ -454,36 +469,61 @@ export default function DiscoverPage() {
             ))}
           </div>
         ) : currentCards.length === 0 ? (
-          <GlassCard className="py-8 px-5 text-center">
-            <div className="w-12 h-12 rounded-full bg-vibe-dusk/10 flex items-center justify-center mx-auto mb-3">
-              <Sparkles className="w-5 h-5 text-vibe-dusk/40" />
+          <div className="space-y-3">
+            {/* ── 📷 现场追加补票：可交互 Dropzone，原地识别、卡片原地蹦出 ── */}
+            <div
+              onClick={() => !shotAppending && shotFileRef.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={handleShotDrop}
+              className="rounded-2xl border-2 border-dashed border-amber-300/60 bg-amber-50/40 backdrop-blur-sm px-5 py-7 text-center cursor-pointer hover:bg-amber-50/60 hover:border-amber-400/70 transition-all active:scale-[0.99]"
+            >
+              {shotAppending ? (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="w-7 h-7 rounded-full border-2 border-amber-300 border-t-amber-500 animate-spin" />
+                  <p className="text-sm text-amber-800/80">正在识别截图，卡片马上蹦出来…</p>
+                </div>
+              ) : (
+                <>
+                  <div className="text-3xl mb-2">📷</div>
+                  <p className="text-sm font-medium text-charcoal/85">没有心仪的推荐？直接在这里上传攻略截图吧！</p>
+                  <p className="text-xs text-muted/60 mt-1.5 leading-relaxed">
+                    点击选择或把图片拖到这里（可多选），AI 原地识别地点，
+                    <br />
+                    识别出的卡片会立刻出现在本页第一排并自动帮你勾选。
+                  </p>
+                </>
+              )}
             </div>
-            <p className="text-sm font-medium text-charcoal/80">没有找到心仪的推荐？试试开启「自定义画布」吧！</p>
-            <p className="text-xs text-muted/70 mt-2 leading-relaxed">
-              我们会保留你规划的往返机票/高铁和预订的酒店，
-              <br />
-              为你生成一张空白的行程骨架，由你来亲手涂鸦每个时段。
-            </p>
             {recommendError && (
-              <p className="text-[11px] text-amber-600/90 mt-2 leading-relaxed">
+              <p className="text-[11px] text-amber-600/90 text-center leading-relaxed">
                 （推荐接口刚才出了点小状况：{recommendError}）
               </p>
             )}
-            <button
-              onClick={handleCustomCanvas}
-              disabled={canvasCreating}
-              className="mt-4 inline-flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium shadow-md active:scale-[0.97] transition-transform disabled:opacity-60"
-            >
-              {canvasCreating ? (
-                <>正在为你搭建画布…</>
-              ) : (
-                <>🎨 一键开启自定义画布，直接去排程</>
+
+            {/* ── 或：纯空白画布（场景一：纯粹的自主规划者） ── */}
+            <GlassCard className="py-6 px-5 text-center">
+              <p className="text-sm font-medium text-charcoal/80">一张截图都没准备？试试开启「自定义画布」吧！</p>
+              <p className="text-xs text-muted/70 mt-2 leading-relaxed">
+                我们会保留你规划的往返机票/高铁和预订的酒店，
+                <br />
+                为你生成一张空白的行程骨架，由你来亲手涂鸦每个时段。
+              </p>
+              <button
+                onClick={handleCustomCanvas}
+                disabled={canvasCreating}
+                className="mt-4 inline-flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium shadow-md active:scale-[0.97] transition-transform disabled:opacity-60"
+              >
+                {canvasCreating ? (
+                  <>正在为你搭建画布…</>
+                ) : (
+                  <>🎨 一键开启自定义画布，直接去排程</>
+                )}
+              </button>
+              {canvasError && (
+                <p className="text-[11px] text-red-500/90 mt-2">{canvasError}</p>
               )}
-            </button>
-            {canvasError && (
-              <p className="text-[11px] text-red-500/90 mt-2">{canvasError}</p>
-            )}
-          </GlassCard>
+            </GlassCard>
+          </div>
         ) : (
           <AnimatePresence mode="wait">
             <motion.div key={activeCategory + mealType + cuisine} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-2.5">
