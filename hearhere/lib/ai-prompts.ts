@@ -202,6 +202,14 @@ export function tripPrompt(
   const returnTimeLabel = tags.returnTime || "午饭后返程";
   const returnHour = RETURN_HOUR[returnTimeLabel] || 13;
 
+  // 🆕 用户自定义精确时间（Page 2 时间选择器，优先级高于模糊标签映射）
+  const depTimeStr = tags.departureTimeVal && /^\d{1,2}:\d{2}$/.test(tags.departureTimeVal)
+    ? tags.departureTimeVal
+    : `${String(departureHour).padStart(2, "0")}:00`;
+  const retTimeStr = tags.returnTimeVal && /^\d{1,2}:\d{2}$/.test(tags.returnTimeVal)
+    ? tags.returnTimeVal
+    : `${String(returnHour).padStart(2, "0")}:00`;
+
   // 🆕 估算路途时间
   const travelEstimate = departure
     ? estimateTravelTime(departure, destination, transportation)
@@ -214,10 +222,10 @@ export function tripPrompt(
     const realDuration = drivingRoute?.durationText || travelLabel;
     const realHours = drivingRoute?.durationHours || travelHours;
     const goItem = departure
-      ? `Day 1 第一个 item 必须是路途「${departure}${transportation || "前往"}${destination}」：time "${String(departureHour).padStart(2, "0")}:00"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
+      ? `Day 1 第一个 item 必须是路途「${departure}${transportation || "前往"}${destination}」：time "${depTimeStr}"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
       : `Day 1 无需路途项，直接从酒店/第一个占位开始`;
     const returnItem = departure
-      ? `最后一天（Day ${dayCount}）最后一个 item 必须是返程「${destination}${transportation || ""}返回${departure}」：time "${String(returnHour).padStart(2, "0")}:00"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
+      ? `最后一天（Day ${dayCount}）最后一个 item 必须是返程「${destination}${transportation || ""}返回${departure}」：time "${retTimeStr}"，source="transport"，transport="${realDuration}"，duration="约 ${realHours} 小时"`
       : `最后一天无需返程项`;
 
     return `你是 HearHere 行程规划师。用户明确选择了「自定义画布」模式：他们不要你推荐任何景点或餐厅，只需要一个物理骨架（大交通+酒店入住+留白占位），其余内容由用户亲手填充。
@@ -267,7 +275,7 @@ JSON 格式：
 目的地：${destination}
 用户原始语音（最高信息源）：「${rawUserText?.trim() || "未提供，以结构化偏好为准"}」
 结构化偏好：${JSON.stringify(tags)}
-出发信息：出发地=${departure || "未知"}，交通=${transportation || "未指定"}，出发时间=${departureTimeLabel}（${String(departureHour).padStart(2, "0")}:00），返程偏好=${returnTimeLabel}（${String(returnHour).padStart(2, "0")}:00）`;
+出发信息：出发地=${departure || "未知"}，交通=${transportation || "未指定"}，出发时间=${departureTimeLabel}（${depTimeStr}），返程偏好=${returnTimeLabel}（${retTimeStr}）`;
   }
 
   const cardHint = hasCards
@@ -347,7 +355,7 @@ JSON 格式：
 用户从「${departure}」${transportation}前往「${destination}」（${realDuration}${distanceHint ? "，" + distanceHint : ""}）。
 
 Day 1 上午第一个活动必须是「${departure}${transportation}前往${destination}」：
-- time: "${String(departureHour).padStart(2, "0")}:00"
+- time: "${depTimeStr}"
 - source: "transport"
 - transport: "${realDuration}"
 - duration: "约 ${realHours} 小时"
@@ -355,7 +363,7 @@ Day 1 上午第一个活动必须是「${departure}${transportation}前往${dest
 - note: "建议早起出发。${serviceAreaHint}"
 
 最后一天（Day ${dayCount}）下午必须包含返程：
-- time: "${String(returnHour).padStart(2, "0")}:00"
+- time: "${retTimeStr}"
 - activity: "${destination}${transportation}返回${departure}"
 - source: "transport"
 - transport: "${realDuration}"
@@ -371,14 +379,14 @@ Day 1 上午第一个活动必须是「${departure}${transportation}前往${dest
 用户从「${departure}」乘坐${transportation}前往「${destination}」（${travelLabel}）。
 
 Day 1 上午第一个活动必须是「${departure}${transportation}前往${destination}」：
-- time: "${String(departureHour).padStart(2, "0")}:00"
+- time: "${depTimeStr}"
 - source: "transport"
 - transport: "${travelLabel}"
 - duration: "${travelLabel}"
 - note: "${transportation === "飞机" ? "建议提前 2 小时到机场，落地后打车/地铁去酒店放行李" : "高铁站一般离市区不远，出站后打车去酒店放行李"}"
 
 最后一天（Day ${dayCount}）下午必须包含返程：
-- time: "${String(returnHour).padStart(2, "0")}:00"
+- time: "${retTimeStr}"
 - activity: "${destination}${transportation}返回${departure}"
 - source: "transport"
 - transport: "${travelLabel}"
@@ -435,7 +443,11 @@ JSON 格式：
 当结构化偏好与原始语音冲突时，以原始语音为准。planningThought 中必须体现你抓住了原始语音里的哪些特殊细节。
 
 天数要求：必须生成完整的 ${dayCount} 天，一天都不能少！！！
-出发信息：出发地=${departure || "未知"}，交通=${transportation || "未指定"}，出发时间=${departureTimeLabel}（${String(departureHour).padStart(2, "0")}:00），返程偏好=${returnTimeLabel}（${String(returnHour).padStart(2, "0")}:00）
+出发信息：出发地=${departure || "未知"}，交通=${transportation || "未指定"}，出发时间=${departureTimeLabel}（${depTimeStr}），返程偏好=${returnTimeLabel}（${retTimeStr}）
+【🕐 时间轴硬性对齐（极其重要）】
+- Day 1 第一个活动（路途）的 time 必须严格等于 ${depTimeStr}，一分钟都不许差！
+- 以 ${depTimeStr} 为逻辑起点顺延推导全天节奏：路途耗时 → 到达 → 酒店入住 → 下午活动。例如 ${depTimeStr} 出发、路途约 ${travelEstimate?.hours ?? 2} 小时，则到达与酒店入住必须排在那之后，绝不允许顽固复读默认的 09:00/14:00。
+- 最后一天返程活动的 time 必须精确等于 ${retTimeStr}，当天上午活动与午餐必须在此时间之前结束，并留出去车站/机场的余量。
 偏好：${JSON.stringify(tags)}
 ${cardHint}
 ${travelInstruction}

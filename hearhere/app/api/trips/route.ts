@@ -486,6 +486,9 @@ export async function POST(req: Request) {
     const returnHour: Record<string, number> = { "午饭后返程": 13, "一早返程": 9 };
     const depHour = departureHour[departureTimeLabel] || 9;
     const retHour = returnHour[tags.returnTime || "午饭后返程"] || 13;
+    // 🆕 用户自定义精确时间优先（Page 2 时间选择器）
+    const depTimeStr = tags.departureTimeVal || `${String(depHour).padStart(2, "0")}:00`;
+    const retTimeStr = tags.returnTimeVal || `${String(retHour).padStart(2, "0")}:00`;
 
     if (departure && transportation && generated.days && generated.days.length > 0) {
       const travelLabel = transportation === "自驾" ? `${departure}自驾前往${destination}` : `${departure}${transportation}前往${destination}`;
@@ -501,7 +504,7 @@ export async function POST(req: Request) {
 
       if (!hasTransportFirst) {
         day1.items.unshift({
-          time: `${String(depHour).padStart(2, "0")}:00`,
+          time: depTimeStr,
           activity: travelLabel,
           note: `从${departure}出发，${transportation === "自驾" ? "路途服务区可以休整" : "提前出发避免赶时间"}`,
           duration: travelDuration,
@@ -523,7 +526,7 @@ export async function POST(req: Request) {
 
       if (!hasReturnLast) {
         lastDay.items.push({
-          time: `${String(retHour).padStart(2, "0")}:00`,
+          time: retTimeStr,
           activity: returnLabel,
           note: tags.returnTime === "一早返程" ? "早起返程，到家还能休息一下迎接新一周" : "午饭后返程，避开晚高峰",
           duration: travelDuration,

@@ -215,7 +215,7 @@ export default function TripPage() {
   const allPoiNames = new Set<string>();
 
   if (trip) {
-    trip.itineraries
+    [...(trip.itineraries ?? [])]
       .sort((a, b) => a.dayIndex - b.dayIndex)
       .forEach((day) => {
         try {
@@ -295,7 +295,7 @@ export default function TripPage() {
   } catch { /* ignore */ }
   const displayTitle = title || `${trip.destination} · 我的旅行攻略`;
 
-  const sortedDays = trip.itineraries.sort((a, b) => a.dayIndex - b.dayIndex);
+  const sortedDays = [...(trip.itineraries ?? [])].sort((a, b) => a.dayIndex - b.dayIndex);
 
   const toggleDay = (dayIndex: number) => {
     setExpandedDays((prev) => {
@@ -423,7 +423,7 @@ export default function TripPage() {
         </div>
 
         {/* ── 天气条 ── */}
-        {weather && (weather.live || weather.forecasts.length > 0) && (
+        {weather && (weather.live || (weather.forecasts?.length ?? 0) > 0) && (
           <div className="px-4 pt-3">
             <GlassCard className="px-4 py-3">
               <div className="flex items-center gap-2 mb-2">
@@ -454,9 +454,9 @@ export default function TripPage() {
                 </div>
               )}
               {/* 预报 */}
-              {weather.forecasts.length > 0 && (
+              {(weather.forecasts ?? []).length > 0 && (
                 <div className="flex gap-1 overflow-x-auto">
-                  {weather.forecasts.slice(0, 4).map((f) => (
+                  {(weather.forecasts ?? []).slice(0, 4).map((f) => (
                     <div
                       key={f.date}
                       className="flex-1 min-w-[60px] text-center py-1"

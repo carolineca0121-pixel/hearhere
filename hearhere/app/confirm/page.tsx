@@ -428,6 +428,17 @@ export default function ConfirmPage() {
     "一早返程": "默认 9:00 返程",
   };
 
+  // 🆕 模糊标签 → 精确时间默认值（用户可通过时间选择器修改）
+  const DEPARTURE_TIME_VALUE: Record<string, string> = {
+    "早上出发": "09:00",
+    "中午出发": "13:00",
+    "下午出发": "15:00",
+  };
+  const RETURN_TIME_VALUE: Record<string, string> = {
+    "午饭后返程": "13:00",
+    "一早返程": "09:00",
+  };
+
   return (
     <div className="space-y-5 py-4">
       {/* 标题 */}
@@ -669,11 +680,18 @@ export default function ConfirmPage() {
                   </button>
                 ))}
               </div>
-              {/* 🆕 默认值说明 */}
+              {/* 🆕 可编辑精确时间（覆盖默认值） */}
               {tags.departureTime && (
-                <p className="text-[10px] text-muted/50">
-                  📌 {DEPARTURE_TIME_DEFAULTS[tags.departureTime]}
-                </p>
+                <div className="flex items-center gap-1.5">
+                  <Clock className="w-3 h-3 text-vibe-sea" />
+                  <input
+                    type="time"
+                    value={tags.departureTimeVal || DEPARTURE_TIME_VALUE[tags.departureTime] || "09:00"}
+                    onChange={(e) => updateTags({ ...tags, departureTimeVal: e.target.value })}
+                    className="rounded-lg border border-vibe-sea/40 bg-vibe-sea/10 px-2 py-0.5 text-xs font-semibold text-charcoal outline-none focus:border-vibe-sea focus:bg-vibe-sea/15"
+                  />
+                  <span className="text-[10px] text-muted/50">出发 · 可点击修改</span>
+                </div>
               )}
             </div>
           </div>
@@ -698,11 +716,18 @@ export default function ConfirmPage() {
                   </button>
                 ))}
               </div>
-              {/* 🆕 默认值说明 */}
+              {/* 🆕 可编辑精确时间（覆盖默认值） */}
               {tags.returnTime && (
-                <p className="text-[10px] text-muted/50">
-                  📌 {RETURN_TIME_DEFAULTS[tags.returnTime]}
-                </p>
+                <div className="flex items-center gap-1.5">
+                  <Clock className="w-3 h-3 text-vibe-dusk" />
+                  <input
+                    type="time"
+                    value={tags.returnTimeVal || RETURN_TIME_VALUE[tags.returnTime] || "13:00"}
+                    onChange={(e) => updateTags({ ...tags, returnTimeVal: e.target.value })}
+                    className="rounded-lg border border-vibe-dusk/40 bg-vibe-dusk/10 px-2 py-0.5 text-xs font-semibold text-charcoal outline-none focus:border-vibe-dusk focus:bg-vibe-dusk/15"
+                  />
+                  <span className="text-[10px] text-muted/50">返程 · 可点击修改</span>
+                </div>
               )}
             </div>
           </div>

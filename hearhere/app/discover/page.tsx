@@ -71,11 +71,14 @@ export default function DiscoverPage() {
   // 选择数量校验
   const [showInsufficientWarning, setShowInsufficientWarning] = useState(false);
   const [canvasCreating, setCanvasCreating] = useState(false);
+  const [canvasError, setCanvasError] = useState<string | null>(null);
+  const [recommendError, setRecommendError] = useState<string | null>(null);
 
   // ── 🎨 自定义画布：推荐为空/不满意时的逃生舱，绝不卡死用户 ──
   const handleCustomCanvas = async () => {
     if (!tags?.destination || canvasCreating) return;
     setCanvasCreating(true);
+    setCanvasError(null);
     try {
       const res = await fetch("/api/trips", {
         method: "POST",
@@ -94,7 +97,8 @@ export default function DiscoverPage() {
       reset(); // 🧹 行程已生成并落库，静默清空本地草稿
       router.push(`/trip/${data.trip.id}`);
     } catch (e) {
-      console.warn("[discover] custom canvas failed:", e);
+      console.error("[discover] custom canvas failed:", e);
+      setCanvasError(e instanceof Error ? e.message : "画布生成失败，请再试一次");
       setCanvasCreating(false);
     }
   };
@@ -126,6 +130,8 @@ export default function DiscoverPage() {
       if (selectedLocations.length > 0 && category !== "attraction") body.selectedLocations = selectedLocations;
       const res = await fetch("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const data = await res.json();
+      // 推荐失败原因透传（如高德 Key 异常/超时），便于 UI 展示与排查
+      setRecommendError(data._error ?? null);
       const cards: PoiCardData[] = (data.pois || []).map((p: any) => {
         if (p.lng != null && p.lat != null) poiCoordsRef.current.set(p.id, { lng: p.lng, lat: p.lat });
         return {
@@ -452,13 +458,17 @@ export default function DiscoverPage() {
             <div className="w-12 h-12 rounded-full bg-vibe-dusk/10 flex items-center justify-center mx-auto mb-3">
               <Sparkles className="w-5 h-5 text-vibe-dusk/40" />
             </div>
-            <p className="text-sm font-medium text-charcoal/80">没有找到心仪的推荐？</p>
-            <p className="text-sm font-medium text-charcoal/80">试试开启「自定义画布」</p>
+            <p className="text-sm font-medium text-charcoal/80">没有找到心仪的推荐？试试开启「自定义画布」吧！</p>
             <p className="text-xs text-muted/70 mt-2 leading-relaxed">
-              保留你的大交通和酒店，生成一张空白行程骨架，
+              我们会保留你规划的往返机票/高铁和预订的酒店，
               <br />
-              由你亲手涂鸦每个时段。
+              为你生成一张空白的行程骨架，由你来亲手涂鸦每个时段。
             </p>
+            {recommendError && (
+              <p className="text-[11px] text-amber-600/90 mt-2 leading-relaxed">
+                （推荐接口刚才出了点小状况：{recommendError}）
+              </p>
+            )}
             <button
               onClick={handleCustomCanvas}
               disabled={canvasCreating}
@@ -470,6 +480,9 @@ export default function DiscoverPage() {
                 <>🎨 一键开启自定义画布，直接去排程</>
               )}
             </button>
+            {canvasError && (
+              <p className="text-[11px] text-red-500/90 mt-2">{canvasError}</p>
+            )}
           </GlassCard>
         ) : (
           <AnimatePresence mode="wait">
