@@ -6,9 +6,11 @@
 
 import { useEffect, useRef, useState } from "react";
 
-const AMAP_JS_KEY = "13357beee837c8a8cfbcfb9828b88e2a";
+// 前端（浏览器端）环境变量必须以 NEXT_PUBLIC_ 开头才能被 Next.js 注入，
+// 硬编码值作为兜底（Vercel 未配 NEXT_PUBLIC_AMAP_KEY 时仍能工作）
+const AMAP_JS_KEY = process.env.NEXT_PUBLIC_AMAP_KEY || "13357beee837c8a8cfbcfb9828b88e2a";
 // 高德 2021 年新规：JS API 必须配套安全密钥，否则线上环境拒绝服务（地图白屏）
-const AMAP_SECURITY_CODE = "5f3d5a4cf24c684699f9446a69f2e2ec";
+const AMAP_SECURITY_CODE = process.env.NEXT_PUBLIC_AMAP_SECURITY_CODE || "5f3d5a4cf24c684699f9446a69f2e2ec";
 
 export interface MapMarker {
   id: string;
@@ -107,12 +109,30 @@ export function AmapView({ markers, city, onMarkerClick, className }: AmapViewPr
     if (create.length > 0) mapRef.current.setFitView(null, false, [80, 80, 80, 320]);
   }, [markers, ready, onMarkerClick]);
 
-  // 城市兜底：没有任何 marker 时，地图也要聚焦到目的地城市（否则白屏）
+  // 城市兜底：没有任何 marker 时，地图也要聚焦到目的地（否则默认北京天安门）
+  // 优先 Geocoder 地理编码（支持景区/区县等非标准城市名），失败降级 setCity
   useEffect(() => {
     if (!ready || !mapRef.current || !city || markers.length > 0) return;
+    const AMap = (window as any).AMap;
+    if (!AMap) return;
+    const fallbackSetCity = () => {
+      try { mapRef.current.setCity(city); } catch { /* 保持默认中心 */ }
+    };
     try {
-      mapRef.current.setCity(city);
-    } catch { /* 城市名无法识别时保持默认中心 */ }
+      AMap.plugin("AMap.Geocoder", () => {
+        try {
+          const geocoder = new AMap.Geocoder({});
+          geocoder.getLocation(city, (status: string, result: any) => {
+            const loc = result?.geocodes?.[0]?.location;
+            if (status === "complete" && loc) {
+              mapRef.current.setZoomAndCenter(12, [loc.lng, loc.lat]);
+            } else {
+              fallbackSetCity();
+            }
+          });
+        } catch { fallbackSetCity(); }
+      });
+    } catch { fallbackSetCity(); }
   }, [ready, city, markers.length]);
 
   return (
