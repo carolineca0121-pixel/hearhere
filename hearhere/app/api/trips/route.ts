@@ -84,6 +84,8 @@ export async function POST(req: Request) {
       conflicts: [],
     };
     const selectedCards = body.selectedCards ?? [];
+    // 自定义画布：显式指定，或未选任何卡片时自动转为画布模式（函数级作用域，后处理要用）
+    const isCustomCanvas = body.isCustomCanvas === true || selectedCards.length === 0;
     const selectedFoods = body.selectedFoods ?? [];
     const enrichedTags: ExtractedTags = selectedFoods.length > 0
       ? {
@@ -135,8 +137,6 @@ export async function POST(req: Request) {
       }
 
       const rawUserText = body.rawUserText?.trim() || undefined;
-      // 自定义画布：显式指定，或未选任何卡片时自动转为画布模式（不让用户卡死）
-      const isCustomCanvas = body.isCustomCanvas === true || selectedCards.length === 0;
       if (isCustomCanvas) {
         console.log("[trips] 🎨 自定义画布模式: 只生成骨架(交通+酒店+placeholder)");
       }
@@ -405,7 +405,8 @@ export async function POST(req: Request) {
           (omitted) => omitted.includes(title) || title.includes(omitted)
         )
       );
-    if (selectedTitles.length > 0) {
+    if (selectedTitles.length > 0 && !isCustomCanvas) {
+      // 2.0 攻略卡模式（isCustomCanvas）：跳过强制插入——卡片留在卡片池，由用户拖入时间轴
       // 收集现有活动
       const existingActivities = new Set(
         (generated.days ?? []).flatMap((d) =>

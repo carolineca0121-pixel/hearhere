@@ -86,7 +86,8 @@ export default function DiscoverPage() {
           destination: tags.destination,
           tags,
           rawUserText: transcript,
-          selectedCards: [],
+          // 2.0：已选卡片随身带入行程（卡片池 + 打卡清单的数据源），画布骨架不受影响
+          selectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason })),
           selectedFoods: [],
           isCustomCanvas: true,
         }),
@@ -308,11 +309,8 @@ export default function DiscoverPage() {
   const isInsufficient = selectedContent.length < minRecommended;
 
   const handleGoBuilder = () => {
-    if (isInsufficient) {
-      setShowInsufficientWarning(true);
-    } else {
-      router.push("/builder");
-    }
+    // 2.0：不再去 builder 页，直接生成骨架行程（交通+酒店预留），进攻略卡页拖拽排程
+    handleCustomCanvas();
   };
 
   if (!_hydrated) return null;
@@ -330,7 +328,7 @@ export default function DiscoverPage() {
           </GlassCard>
           {selectedContent.length > 0 && (
             <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} className="pointer-events-auto">
-              <button onClick={() => router.push("/builder")} className="flex items-center gap-1.5 bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white rounded-full px-4 py-2 shadow-lg text-sm font-medium">
+              <button onClick={handleCustomCanvas} className="flex items-center gap-1.5 bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white rounded-full px-4 py-2 shadow-lg text-sm font-medium">
                 已选 {selectedContent.length}
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
@@ -648,7 +646,7 @@ export default function DiscoverPage() {
                     再去选一些
                   </button>
                   <button
-                    onClick={() => router.push("/builder")}
+                    onClick={() => { setShowInsufficientWarning(false); handleCustomCanvas(); }}
                     className="px-4 py-2.5 rounded-xl border border-charcoal/15 text-sm text-muted hover:text-charcoal transition-colors"
                   >
                     直接生成

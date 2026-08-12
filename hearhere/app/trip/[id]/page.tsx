@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { GlassCard } from "@/components/layout/glass-card";
 import { MeshBackground } from "@/components/layout/mesh-background";
@@ -83,6 +83,12 @@ export default function TripPage() {
   const [nearbyKey, setNearbyKey] = useState<string | null>(null);
   const [nearbyList, setNearbyList] = useState<{ name: string; type: string; distance: number }[]>([]);
   const [nearbyLoading, setNearbyLoading] = useState(false);
+  // ── 2.0 攻略卡：可编辑时间轴 + 卡片池 + 打卡清单 ──
+  const [editDays, setEditDays] = useState<Record<number, DayPlanItem[]>>({});
+  const [pickedCard, setPickedCard] = useState<string | null>(null);
+  const dragCardRef = useRef<string | null>(null);
+  const [savingDays, setSavingDays] = useState(false);
+  const [checkedSpots, setCheckedSpots] = useState<Set<string>>(new Set());
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
   const [sharing, setSharing] = useState(false);
@@ -116,6 +122,69 @@ export default function TripPage() {
       .then((d) => { if (d?.expenses) setExpenses(d.expenses); })
       .catch(() => { /* 静默 */ });
   }, [id]);
+
+  // ── 2.0 攻略卡：行程加载后初始化可编辑时间轴 ──
+  useEffect(() => {
+    if (!trip) return;
+    const map: Record<number, DayPlanItem[]> = {};
+    for (const d of trip.itineraries ?? []) {
+      try { map[d.dayIndex] = JSON.parse(d.content); } catch { map[d.dayIndex] = []; }
+    }
+    setEditDays(map);
+  }, [trip]);
+
+  // 打卡清单：按行程持久化到 localStorage
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(`hh-checklist-${id}`);
+      if (raw) setCheckedSpots(new Set(JSON.parse(raw)));
+    } catch { /* ignore */ }
+  }, [id]);
+
+  const toggleSpot = (t: string) => {
+    setCheckedSpots((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t); else next.add(t);
+      try { localStorage.setItem(`hh-checklist-${id}`, JSON.stringify(Array.from(next))); } catch { /* ignore */ }
+      return next;
+    });
+  };
+
+  const persistDays = async (daysMap: Record<number, DayPlanItem[]>) => {
+    setSavingDays(true);
+    try {
+      await fetch(`/api/trips/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          days: Object.entries(daysMap).map(([dayIndex, items]) => ({ dayIndex: Number(dayIndex), items })),
+        }),
+      });
+    } catch { /* 静默 */ } finally { setSavingDays(false); }
+  };
+
+  // 把卡片池中的卡放进某天某小时（同一地点重复放置会自动移动）
+  const placeCard = (dayIndex: number, hour: number, title: string) => {
+    const next = { ...editDays };
+    const items = (next[dayIndex] ?? []).filter((it) => it.activity !== title);
+    items.push({
+      time: `${String(hour).padStart(2, "0")}:00`,
+      activity: title,
+      source: "selected_card",
+    });
+    items.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    next[dayIndex] = items;
+    setEditDays(next);
+    setPickedCard(null);
+    persistDays(next);
+  };
+
+  const removePlacedItem = (dayIndex: number, title: string) => {
+    const next = { ...editDays };
+    next[dayIndex] = (next[dayIndex] ?? []).filter((it) => it.activity !== title);
+    setEditDays(next);
+    persistDays(next);
+  };
 
   // ── 分享 ──
   const handleShare = async () => {
@@ -290,14 +359,22 @@ export default function TripPage() {
   let overview = "";
   let travelTips: string[] = [];
   let planningThought = "";
+  let prefSelectedCards: { title?: string }[] = [];
   try {
     const pref = JSON.parse(trip.preferences);
     title = pref.title ?? "";
     overview = pref.overview ?? "";
     travelTips = pref.travelTips ?? [];
     planningThought = pref.planningThought ?? "";
+    prefSelectedCards = Array.isArray(pref.selectedCards) ? pref.selectedCards : [];
   } catch { /* ignore */ }
   const displayTitle = title || `${trip.destination} · 我的旅行攻略`;
+
+  // ── 2.0 攻略卡：卡片池 = 已选卡片 - 已排入时间轴的 ──
+  const selectedCardTitles: string[] = prefSelectedCards.map((c) => c?.title).filter(Boolean) as string[];
+  const usedTitles = new Set(Object.values(editDays).flat().map((it: any) => it?.activity).filter(Boolean));
+  const cardPool = selectedCardTitles.filter((t) => !usedTitles.has(t));
+  const totalExpenseAmount = expenses.reduce((s, e) => s + e.amount, 0);
 
   const sortedDays = [...(trip.itineraries ?? [])].sort((a, b) => a.dayIndex - b.dayIndex);
 
@@ -484,14 +561,50 @@ export default function TripPage() {
           </div>
         )}
 
-        {/* ── 每日行程卡片 ── */}
+        {/* ── 🧺 待安排卡片池（点选或拖入下方时间轴） ── */}
+        {cardPool.length > 0 && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-3">
+              <p className="text-xs font-medium text-charcoal/80 mb-2">
+                🧺 待安排卡片
+                <span className="text-muted/60 font-normal ml-1">点一下选中，再点下方时间轴空格放入（桌面端可直接拖拽）</span>
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {cardPool.map((t) => (
+                  <button
+                    key={t}
+                    draggable
+                    onDragStart={() => { dragCardRef.current = t; }}
+                    onClick={() => setPickedCard(pickedCard === t ? null : t)}
+                    className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs transition-all ${
+                      pickedCard === t
+                        ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-md scale-105"
+                        : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white"
+                    }`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </GlassCard>
+          </div>
+        )}
+
+        {/* ── 📋 每日攻略卡（6:00–24:00 小时级时间轴） ── */}
         <div className="flex-1 px-4 py-4 space-y-3 pb-28">
           {sortedDays.map((day) => {
-            const items = (() => {
-            try { return JSON.parse(day.content) as (DayPlanItem & { source?: string; recommendedDish?: string; period?: string; })[]; }
-            catch { return []; }
-            })();
-            const isExpanded = expandedDays.has(day.dayIndex);
+            const dayItems = (editDays[day.dayIndex] ?? []).filter(
+              (it: any) => it?.source !== "placeholder" && it?.activity
+            );
+            const hourOf = (t?: string) => {
+              const m = /^(\d{1,2})/.exec(t || "");
+              return m ? parseInt(m[1], 10) : null;
+            };
+            const itemHours = dayItems.map((it: any) => hourOf(it.time)).filter((h): h is number => h !== null);
+            const minHour = Math.min(6, ...(itemHours.length > 0 ? itemHours : [6]));
+            const maxHour = Math.max(23, ...(itemHours.length > 0 ? itemHours : [23]));
+            const hours = Array.from({ length: maxHour - minHour + 1 }, (_, i) => minHour + i);
+            const dayWeather = weather?.forecasts?.[day.dayIndex - 1];
 
             return (
               <motion.div
@@ -501,267 +614,126 @@ export default function TripPage() {
                 transition={{ delay: day.dayIndex * 0.08 }}
               >
                 <GlassCard className="overflow-hidden">
-                  {/* 天标题 — 点击折叠/展开 */}
-                  <button
-                    onClick={() => toggleDay(day.dayIndex)}
-                    className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/30 transition-colors"
-                  >
-                    <div className="flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-vibe-sea to-vibe-dusk flex items-center justify-center text-white text-xs font-bold">
-                        {day.dayIndex}
-                      </div>
-                      <span className="text-sm font-semibold text-charcoal">
-                        第 {day.dayIndex} 天
-                      </span>
-                      <span className="text-xs text-muted">
-                        {items.length} 项活动
-                      </span>
+                  {/* 卡头：Day N · 目的地 */}
+                  <div className="flex items-center gap-2 px-4 py-3 border-b border-charcoal/5">
+                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-vibe-sea to-vibe-dusk flex items-center justify-center text-white text-xs font-bold">
+                      {day.dayIndex}
                     </div>
-                    <motion.div
-                      animate={{ rotate: isExpanded ? 180 : 0 }}
-                      transition={{ duration: 0.2 }}
-                    >
-                      <ChevronDown className="w-4 h-4 text-muted" />
-                    </motion.div>
-                  </button>
+                    <span className="text-sm font-semibold text-charcoal">
+                      Day {day.dayIndex} · {trip.destination}
+                    </span>
+                    {savingDays && <span className="text-[10px] text-muted/60 ml-auto">保存中…</span>}
+                  </div>
 
-                  {/* 展开内容 */}
-                  <AnimatePresence>
-                    {isExpanded && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.3 }}
-                        className="overflow-hidden"
-                      >
-                        <div className="px-4 pb-4">
-                          <div className="space-y-0">
-                            {items.map((item, i) => {
-                              const isFood = item.source === "food";
-                              const isTransport = item.source === "transport";
-                              const isSelected = item.source === "selected_card";
-                              const isRest = item.source === "rest";
-
-                              // ── 🎨 自定义画布占位卡：虚线、可点击补充活动 ──
-                              if (item.source === "placeholder") {
-                                const phKey = `${day.dayIndex}-${i}`;
-                                const submitPlaceholder = () => {
-                                  if (!placeholderText.trim() || adjusting) return;
-                                  handleVoiceAdjust(
-                                    `把第${day.dayIndex}天 ${item.time} 的空白时段安排为：${placeholderText.trim()}`
-                                  );
-                                  setActivePlaceholder(null);
-                                  setPlaceholderText("");
-                                };
-                                // 🤖 帮我想一个：结合当天上下文做局部 AI 推理
-                                const helpMeFill = () => {
-                                  if (adjusting) return;
-                                  const realItems = items.filter((x) => x.source !== "placeholder" && x.activity);
-                                  const before = realItems.filter((x) => (x.time || "") <= (item.time || "")).map((x) => x.activity);
-                                  const after = realItems.filter((x) => (x.time || "") > (item.time || "")).map((x) => x.activity);
-                                  const ctx = `该时段之前的安排：${before.join("、") || "无"}；之后的安排：${after.join("、") || "无"}`;
-                                  handleVoiceAdjust(
-                                    `请为第${day.dayIndex}天 ${item.time} 的空白时段智能推荐一个顺路活动（${ctx}），要求地理位置顺路、步行或短途可达、节奏合理，直接安排进这个时间槽，并在 note 里说明推荐理由（如「离上午的XX步行仅10分钟」）`
-                                  );
-                                  setActivePlaceholder(null);
-                                };
-                                // 📍 看看周边：用前后景点的坐标锚点搜 1.5km 内的真实去处
-                                const loadNearby = async () => {
-                                  if (nearbyLoading) return;
-                                  const withCoords = items.filter((x: any) => x.lng && x.lat && x.source !== "placeholder");
-                                  if (withCoords.length === 0) {
-                                    setNearbyKey(phKey);
-                                    setNearbyList([]);
-                                    return;
-                                  }
-                                  const beforeC = withCoords.filter((x: any) => (x.time || "") <= (item.time || ""));
-                                  const anchor: any = beforeC.length > 0 ? beforeC[beforeC.length - 1] : withCoords[0];
-                                  setNearbyLoading(true);
-                                  setNearbyKey(phKey);
-                                  try {
-                                    const res = await fetch("/api/poi-nearby", {
-                                      method: "POST",
-                                      headers: { "Content-Type": "application/json" },
-                                      body: JSON.stringify({ lng: anchor.lng, lat: anchor.lat }),
-                                    });
-                                    const data = await res.json();
-                                    setNearbyList(data.pois ?? []);
-                                  } catch {
-                                    setNearbyList([]);
-                                  } finally {
-                                    setNearbyLoading(false);
-                                  }
-                                };
-                                return (
-                                  <div key={i} className="py-2">
-                                    {activePlaceholder === phKey ? (
-                                      <div className="rounded-xl border-2 border-dashed border-vibe-dusk/50 bg-white/60 px-3 py-2.5 space-y-2">
-                                        <div className="flex gap-2 items-center">
-                                          <input
-                                            autoFocus
-                                            value={placeholderText}
-                                            onChange={(e) => setPlaceholderText(e.target.value)}
-                                            onKeyDown={(e) => { if (e.key === "Enter") submitPlaceholder(); }}
-                                            placeholder="想安排什么？如：找家湖边咖啡馆发呆"
-                                            className="flex-1 bg-transparent text-sm text-charcoal outline-none placeholder:text-muted/50"
-                                          />
-                                          <button
-                                            onClick={submitPlaceholder}
-                                            disabled={adjusting || !placeholderText.trim()}
-                                            className="shrink-0 text-xs text-white bg-gradient-to-r from-vibe-sea to-vibe-dusk rounded-lg px-3 py-1.5 disabled:opacity-50"
-                                          >
-                                            {adjusting ? "安排中…" : "确认"}
-                                          </button>
-                                        </div>
-                                        <div className="flex gap-2">
-                                          <button
-                                            onClick={helpMeFill}
-                                            disabled={adjusting}
-                                            className="flex-1 py-1.5 rounded-lg bg-vibe-sea/10 border border-vibe-sea/30 text-xs text-vibe-sea font-medium hover:bg-vibe-sea/20 transition-colors disabled:opacity-50"
-                                          >
-                                            🤖 帮我想一个
-                                          </button>
-                                          <button
-                                            onClick={loadNearby}
-                                            disabled={nearbyLoading}
-                                            className="flex-1 py-1.5 rounded-lg bg-amber-50 border border-amber-300/50 text-xs text-amber-700 font-medium hover:bg-amber-100/60 transition-colors disabled:opacity-50"
-                                          >
-                                            {nearbyLoading && nearbyKey === phKey ? "查找中…" : "📍 看看周边"}
-                                          </button>
-                                        </div>
-                                        {nearbyKey === phKey && !nearbyLoading && nearbyList.length > 0 && (
-                                          <div className="flex flex-wrap gap-1.5 pt-1">
-                                            <p className="w-full text-[10px] text-muted/60">
-                                              🛎️ 已为您锁定该时段周边 1.5 公里内的优质去处，点一下直接填入：
-                                            </p>
-                                            {nearbyList.map((p) => (
-                                              <button
-                                                key={p.name}
-                                                disabled={adjusting}
-                                                onClick={() => {
-                                                  handleVoiceAdjust(
-                                                    `把第${day.dayIndex}天 ${item.time} 的空白时段安排为：去「${p.name}」（${p.type}，距前后行程约 ${p.distance} 米）`
-                                                  );
-                                                  setActivePlaceholder(null);
-                                                  setNearbyKey(null);
-                                                }}
-                                                className="inline-flex items-center gap-1 rounded-full bg-white border border-amber-300/60 px-2.5 py-1 text-xs text-charcoal/80 hover:bg-amber-50 transition-colors disabled:opacity-50"
-                                              >
-                                                {p.name}
-                                                <span className="text-[10px] text-muted/50">{p.distance}m</span>
-                                              </button>
-                                            ))}
-                                          </div>
-                                        )}
-                                        {nearbyKey === phKey && !nearbyLoading && nearbyList.length === 0 && (
-                                          <p className="text-[11px] text-muted/60 pt-1">
-                                            附近暂时没搜到合适的去处，试试「🤖 帮我想一个」或手动输入吧
-                                          </p>
-                                        )}
-                                      </div>
-                                    ) : (
-                                      <button
-                                        onClick={() => { setActivePlaceholder(phKey); setPlaceholderText(""); setNearbyKey(null); }}
-                                        className="w-full rounded-xl border-2 border-dashed border-vibe-dusk/30 bg-white/30 py-3.5 px-3 flex items-center justify-center gap-2 text-sm text-vibe-dusk/60 hover:bg-white/50 hover:border-vibe-dusk/50 transition-colors"
-                                      >
-                                        <Plus className="w-4 h-4" />
-                                        <span>添加活动</span>
-                                        <span className="text-xs text-muted/50">
-                                          {item.period || item.time} · 这个时段由你决定
-                                        </span>
-                                      </button>
-                                    )}
-                                  </div>
-                                );
-                              }
-
-                              return (
-                                <div key={i} className="relative flex gap-3 py-3 border-b border-charcoal/5 last:border-0">
-                                  {/* 时间轴连线 */}
-                                  <div className="flex flex-col items-center">
-                                    <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 mt-1 ${
-                                      isFood ? "bg-green-400" :
-                                      isTransport ? "bg-blue-400" :
-                                      isRest ? "bg-purple-400" :
-                                      "bg-vibe-dusk/60"
-                                    }`} />
-                                    {i < items.length - 1 && (
-                                      <div className="w-px flex-1 bg-charcoal/10 mt-1" />
-                                    )}
-                                  </div>
-
-                                  {/* 内容 */}
-                                  <div className="flex-1 min-w-0 pb-1">
-                                    {/* 时间 — fuzzy period + exact time */}
-                                    <div className="flex items-center gap-2 flex-wrap mb-1">
-                                      {item.period && (
-                                        <span className="text-xs font-medium text-charcoal/80">
-                                          {item.period}
-                                        </span>
-                                      )}
-                                      <span className="text-[10px] font-mono text-muted/50">
-                                        {item.time}
-                                      </span>
-                                      {item.duration && (
-                                        <span className="inline-flex items-center gap-0.5 text-[10px] text-muted/60">
-                                          <Clock className="w-2.5 h-2.5" />
-                                          {item.duration}
-                                        </span>
-                                      )}
-                                      {item.source && SOURCE_COLORS[item.source] && (
-                                        <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${SOURCE_COLORS[item.source]}`}>
-                                          {SOURCE_ICONS[item.source]}
-                                          {isSelected ? "你选" : isFood ? "美食" : isTransport ? "交通" : isRest ? "休息" : ""}
-                                        </span>
-                                      )}
-                                    </div>
-
-                                    <p className="text-sm font-medium text-charcoal leading-snug">
-                                      {item.activity}
-                                    </p>
-
-                                    {item.note && (
-                                      <p className="text-xs text-muted/70 mt-0.5 leading-relaxed">
-                                        {item.note}
-                                      </p>
-                                    )}
-
-                                    {/* 附加信息行 */}
-                                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1">
-                                      {item.transport && (
-                                        <span className="inline-flex items-center gap-0.5 text-[11px] text-charcoal/50">
-                                          <Bus className="w-2.5 h-2.5" />
-                                          {item.transport}
-                                        </span>
-                                      )}
-                                      {item.cost && (
-                                        <span className="inline-flex items-center gap-0.5 text-[11px] text-charcoal/50">
-                                          <Coins className="w-2.5 h-2.5" />
-                                          {item.cost}
-                                        </span>
-                                      )}
-                                      {item.tips && (
-                                        <span className="text-[11px] text-amber-600">
-                                          <Lightbulb className="w-2.5 h-2.5 inline mr-0.5" />
-                                          {item.tips}
-                                        </span>
-                                      )}
-                                      {item.recommendedDish && (
-                                        <span className="inline-flex items-center gap-0.5 text-[11px] text-emerald-600 font-medium">
-                                          🍜 {item.recommendedDish}
-                                        </span>
-                                      )}
-                                    </div>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
+                  <div className="flex flex-col md:flex-row gap-3 p-3">
+                    {/* ── 左栏：天气 / 预算 / 打卡清单 ── */}
+                    <div className="flex md:flex-col gap-2 md:w-28 shrink-0">
+                      <div className="flex-1 rounded-xl bg-sky-50/70 border border-sky-200/50 p-2 text-center">
+                        <p className="text-[10px] text-muted/60">天气&amp;温度</p>
+                        {dayWeather ? (
+                          <>
+                            <p className="text-base mt-0.5">
+                              {/雨/.test(dayWeather.dayWeather) ? "🌧️" : /雪/.test(dayWeather.dayWeather) ? "❄️" : /阴|云/.test(dayWeather.dayWeather) ? "⛅" : "☀️"}
+                            </p>
+                            <p className="text-xs font-semibold text-charcoal/85">
+                              {dayWeather.nightTemp}°~{dayWeather.dayTemp}°
+                            </p>
+                            <p className="text-[10px] text-muted/70">{dayWeather.dayWeather}</p>
+                          </>
+                        ) : (
+                          <p className="text-[10px] text-muted/50 mt-1">暂无</p>
+                        )}
+                      </div>
+                      <div className="flex-1 rounded-xl bg-amber-50/70 border border-amber-200/50 p-2 text-center">
+                        <p className="text-[10px] text-muted/60">今日预算</p>
+                        <p className="text-xs font-semibold text-charcoal/85 mt-0.5">已花 ¥{totalExpenseAmount}</p>
+                        <p className="text-[10px] text-muted/50">（全程累计）</p>
+                      </div>
+                      <div className="flex-1 rounded-xl bg-emerald-50/60 border border-emerald-200/50 p-2">
+                        <p className="text-[10px] text-muted/60 text-center mb-1">打卡清单</p>
+                        <div className="space-y-0.5">
+                          {selectedCardTitles.slice(0, 8).map((t) => (
+                            <button key={t} onClick={() => toggleSpot(t)} className="w-full flex items-center gap-1 text-left">
+                              <span className="text-[10px]">{checkedSpots.has(t) ? "☑️" : "⬜"}</span>
+                              <span className={`text-[10px] leading-tight ${checkedSpots.has(t) ? "line-through text-muted/50" : "text-charcoal/80"}`}>{t}</span>
+                            </button>
+                          ))}
+                          {selectedCardTitles.length === 0 && (
+                            <p className="text-[10px] text-muted/40 text-center">无</p>
+                          )}
                         </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
+                      </div>
+                    </div>
+
+                    {/* ── 右栏：小时级时间轴（重点） ── */}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[10px] text-muted/60 mb-1">今日行程</p>
+                      <div>
+                        {hours.map((h) => {
+                          const rowItems = dayItems.filter((it: any) => hourOf(it.time) === h);
+                          const canPlace = pickedCard !== null;
+                          return (
+                            <div
+                              key={h}
+                              onDragOver={(e) => e.preventDefault()}
+                              onDrop={() => {
+                                if (dragCardRef.current) {
+                                  placeCard(day.dayIndex, h, dragCardRef.current);
+                                  dragCardRef.current = null;
+                                }
+                              }}
+                              onClick={() => { if (pickedCard) placeCard(day.dayIndex, h, pickedCard); }}
+                              className={`flex gap-2 items-start py-1 border-b border-charcoal/5 last:border-0 min-h-[32px] ${
+                                canPlace ? "cursor-pointer hover:bg-vibe-sea/5 rounded-lg" : ""
+                              }`}
+                            >
+                              <span className="w-10 shrink-0 text-[10px] font-mono text-muted/60 pt-1">
+                                {String(h).padStart(2, "0")}:00
+                              </span>
+                              <div className="flex-1 flex flex-wrap gap-1.5 items-center">
+                                {rowItems.length === 0 ? (
+                                  <span className={`text-[11px] ${canPlace ? "text-vibe-sea font-medium" : "text-muted/25"}`}>
+                                    {canPlace ? `＋ 点击放入「${pickedCard}」` : "·"}
+                                  </span>
+                                ) : (
+                                  rowItems.map((it: any, idx: number) => {
+                                    const fixed = it.source === "transport" || it.source === "rest";
+                                    return (
+                                      <span
+                                        key={idx}
+                                        className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs ${
+                                          it.source === "transport"
+                                            ? "bg-blue-50 border border-blue-200/60 text-blue-800"
+                                            : it.source === "rest"
+                                            ? "bg-purple-50 border border-purple-200/60 text-purple-800"
+                                            : it.source === "food"
+                                            ? "bg-green-50 border border-green-200/60 text-green-800"
+                                            : "bg-vibe-sea/10 border border-vibe-sea/30 text-charcoal"
+                                        }`}
+                                      >
+                                        {it.source === "transport" ? "🚄" : it.source === "rest" ? "🏨" : it.source === "food" ? "🍜" : "📍"}
+                                        <span className="font-medium">{it.activity}</span>
+                                        {it.duration && <span className="text-[10px] opacity-60">{it.duration}</span>}
+                                        {it.cost && <span className="text-[10px] opacity-60">{it.cost}</span>}
+                                        {!fixed && (
+                                          <button
+                                            onClick={(e) => { e.stopPropagation(); removePlacedItem(day.dayIndex, it.activity); }}
+                                            className="ml-0.5 text-muted/50 hover:text-red-500"
+                                          >
+                                            ×
+                                          </button>
+                                        )}
+                                      </span>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
                 </GlassCard>
               </motion.div>
             );
