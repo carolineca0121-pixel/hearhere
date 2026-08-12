@@ -3,27 +3,25 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Building2, Users, Clock, Car, X, AlertTriangle, Check } from "lucide-react";
+import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Users, Clock, Car, X, AlertTriangle, Check, Mic, Square } from "lucide-react";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
 import { useSessionStore } from "@/stores/session";
-import { compressImage } from "@/lib/compress-image";
+import { getMicErrorMessage } from "@/lib/mic";
 
-type DiscoverCategory = "attraction" | "food" | "souvenir" | "hotel";
+type DiscoverCategory = "attraction" | "food" | "souvenir"; // 2.0: 酒店分类删除（品牌质量一般、可有可无）
 
 const CATEGORIES: { key: DiscoverCategory; label: string; icon: React.ReactNode }[] = [
   { key: "attraction", label: "景点", icon: <MapPin className="w-4 h-4" /> },
   { key: "food", label: "美食", icon: <Utensils className="w-4 h-4" /> },
   { key: "souvenir", label: "伴手礼", icon: <Gift className="w-4 h-4" /> },
-  { key: "hotel", label: "酒店", icon: <Building2 className="w-4 h-4" /> },
 ];
 
 const CAT_DESC: Record<DiscoverCategory, string> = {
   attraction: "根据你的偏好，推荐这些地点",
   food: "根据你的口味，找到最对胃的那一口",
   souvenir: "带点当地特色回家",
-  hotel: "根据预算和位置推荐住宿",
 };
 
 // ── 美食筛选 Chip ──
@@ -54,7 +52,7 @@ export default function DiscoverPage() {
   const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces, reset } = useSessionStore();
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
-    attraction: [], food: [], souvenir: [], hotel: [],
+    attraction: [], food: [], souvenir: [],
   });
   const [loading, setLoading] = useState(false);
   // 🚀 已加载分类缓存标记 + 各分类请求中状态（Tab 切换 0ms 读缓存）
@@ -65,9 +63,6 @@ export default function DiscoverPage() {
   const poiCoordsRef = useRef<Map<string, { lng: number; lat: number }>>(new Map());
   // 📷 用户手动移除的截图地名（不强行加回）；新增地名会自动蹦入
   const dismissedShotsRef = useRef<Set<string>>(new Set());
-  // 📷 追加上传截图
-  const shotFileRef = useRef<HTMLInputElement | null>(null);
-  const [shotAppending, setShotAppending] = useState(false);
 
   // 美食筛选
   const [mealType, setMealType] = useState("");
@@ -174,7 +169,7 @@ export default function DiscoverPage() {
     if (!_hydrated || !destination || prefetchFiredRef.current) return;
     prefetchFiredRef.current = true;
     Promise.all(
-      (["attraction", "food", "souvenir", "hotel"] as DiscoverCategory[]).map((c) => loadCategory(c))
+      (["attraction", "food", "souvenir"] as DiscoverCategory[]).map((c) => loadCategory(c))
     );
   }, [_hydrated, destination, loadCategory]);
 
@@ -224,41 +219,76 @@ export default function DiscoverPage() {
     }
   };
 
-  // 📷 增量追加：在 Page 3 直接上传新截图（支持多选/拖拽），识别地名合并去重后自动蹦入卡片
-  const processShotFiles = async (files: File[]) => {
-    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
-    if (imageFiles.length === 0 || shotAppending) return;
-    setShotAppending(true);
+  // 🎙️ 语音补充地点（2.0：P3 不再传截图，直接说「我一定要去外滩和黄浦江」）
+  const voiceMediaRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceProcessing, setVoiceProcessing] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+
+  const processVoice = async (blob: Blob) => {
+    setVoiceProcessing(true);
+    setVoiceError(null);
     try {
-      const collected: string[] = [];
-      for (const file of imageFiles) {
-        const compressed = await compressImage(file);
-        const fd = new FormData();
-        fd.append("file", new File([compressed.blob], file.name || "shot.jpg", { type: "image/jpeg" }));
-        const res = await fetch("/api/extract-image", { method: "POST", body: fd });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "识别失败");
-        (data.mentionedPlaces ?? []).forEach((p: string) => collected.push(p));
+      const fd = new FormData();
+      fd.append("file", blob);
+      const asrRes = await fetch("/api/asr", { method: "POST", body: fd });
+      const asrData = await asrRes.json();
+      if (!asrRes.ok) throw new Error(asrData.error ?? "转写失败");
+      const text = (asrData.text || "").trim();
+      if (!text) throw new Error("没听清，请再说一次");
+
+      const res = await fetch("/api/extract-places", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, destination }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "识别失败");
+      const places: { name: string; address?: string; lng?: number; lat?: number }[] = data.places ?? [];
+      if (places.length === 0) throw new Error("没有识别出具体地点，可以说「我想去XX」试试");
+      for (const p of places) {
+        const id = `voice-${p.name}`;
+        if (p.lng && p.lat) poiCoordsRef.current.set(id, { lng: p.lng, lat: p.lat });
+        if (!selectedContent.some((c) => c.id === id)) {
+          addContentCard({
+            id,
+            title: p.name,
+            description: p.address || "语音补充的地点",
+            reason: "你语音说要去的",
+            category: "attraction",
+            status: "selected",
+          });
+        }
       }
-      if (collected.length > 0) {
-        setScreenshotPlaces(Array.from(new Set([...screenshotPlaces, ...collected])));
-      }
-    } catch (err) {
-      console.warn("[discover] shot append failed:", err);
+    } catch (e) {
+      setVoiceError(e instanceof Error ? e.message : "语音识别失败");
     } finally {
-      setShotAppending(false);
-      if (shotFileRef.current) shotFileRef.current.value = "";
+      setVoiceProcessing(false);
     }
   };
 
-  const handleShotAppend = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    await processShotFiles(Array.from(e.target.files ?? []));
+  const startVoice = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      voiceChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) voiceChunksRef.current.push(e.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(voiceChunksRef.current, { type: "audio/webm" });
+        await processVoice(blob);
+      };
+      voiceMediaRef.current = recorder;
+      recorder.start();
+      setVoiceRecording(true);
+      setVoiceError(null);
+    } catch (e) {
+      setVoiceError(getMicErrorMessage(e));
+    }
   };
 
-  const handleShotDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
-    await processShotFiles(Array.from(e.dataTransfer.files));
-  };
+  const stopVoice = () => { voiceMediaRef.current?.stop(); setVoiceRecording(false); };
 
   const handleToggle = (card: PoiCardData) => {
     if (selectedIds.has(card.id)) { removeContentCard(card.id); }
@@ -358,27 +388,10 @@ export default function DiscoverPage() {
                   </button>
                 );
               })}
-              <button
-                onClick={() => shotFileRef.current?.click()}
-                disabled={shotAppending}
-                className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs border border-dashed border-vibe-dusk/40 text-vibe-dusk/70 hover:bg-white/60 transition-colors disabled:opacity-50"
-              >
-                {shotAppending ? "识别中…" : "➕ 追加上传攻略截图"}
-              </button>
             </div>
           </GlassCard>
         </div>
       )}
-
-      {/* 截图上传隐藏 input（常驻，供追加按钮与白屏 Dropzone 共用） */}
-      <input
-        ref={shotFileRef}
-        type="file"
-        accept="image/jpeg,image/png,image/webp"
-        multiple
-        className="hidden"
-        onChange={handleShotAppend}
-      />
 
       {/* ── 🛎️ 数据守护横幅 ── */}
       {(transcript || screenshotPlaces.length > 0) && (
@@ -388,6 +401,37 @@ export default function DiscoverPage() {
           </p>
         </div>
       )}
+
+      {/* ── 🎙️ 语音补充地点（2.0 场景三主入口） ── */}
+      <div className="px-4 mt-2">
+        <button
+          onClick={voiceRecording ? stopVoice : startVoice}
+          disabled={voiceProcessing}
+          className={`w-full py-2.5 rounded-2xl text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+            voiceRecording
+              ? "bg-red-100 text-red-600 border border-red-300"
+              : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white shadow-sm"
+          } disabled:opacity-60`}
+        >
+          {voiceProcessing ? (
+            <>
+              <span className="w-3.5 h-3.5 animate-spin rounded-full border-2 border-vibe-dusk/30 border-t-vibe-dusk" />
+              正在识别你说的地方…
+            </>
+          ) : voiceRecording ? (
+            <>
+              <Square className="w-3.5 h-3.5 fill-red-500 text-red-500 animate-pulse" />
+              录音中…说完点这里结束
+            </>
+          ) : (
+            <>
+              <Mic className="w-4 h-4 text-vibe-dusk" />
+              语音补充想去的地点（如：我一定要去外滩和黄浦江）
+            </>
+          )}
+        </button>
+        {voiceError && <p className="text-[11px] text-red-500/90 mt-1 text-center">{voiceError}</p>}
+      </div>
 
       {/* ── 类别 Tab ── */}
       <div className="px-4 mt-3">
@@ -484,30 +528,16 @@ export default function DiscoverPage() {
           </div>
         ) : currentCards.length === 0 ? (
           <div className="space-y-3">
-            {/* ── 📷 现场追加补票：可交互 Dropzone，原地识别、卡片原地蹦出 ── */}
-            <div
-              onClick={() => !shotAppending && shotFileRef.current?.click()}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={handleShotDrop}
-              className="rounded-2xl border-2 border-dashed border-amber-300/60 bg-amber-50/40 backdrop-blur-sm px-5 py-7 text-center cursor-pointer hover:bg-amber-50/60 hover:border-amber-400/70 transition-all active:scale-[0.99]"
-            >
-              {shotAppending ? (
-                <div className="flex flex-col items-center gap-2">
-                  <div className="w-7 h-7 rounded-full border-2 border-amber-300 border-t-amber-500 animate-spin" />
-                  <p className="text-sm text-amber-800/80">正在识别截图，卡片马上蹦出来…</p>
-                </div>
-              ) : (
-                <>
-                  <div className="text-3xl mb-2">📷</div>
-                  <p className="text-sm font-medium text-charcoal/85">没有心仪的推荐？直接在这里上传攻略截图吧！</p>
-                  <p className="text-xs text-muted/60 mt-1.5 leading-relaxed">
-                    点击选择或把图片拖到这里（可多选），AI 原地识别地点，
-                    <br />
-                    识别出的卡片会立刻出现在本页第一排并自动帮你勾选。
-                  </p>
-                </>
-              )}
-            </div>
+            {/* ── 🎙️ 2.0：P3 不再传截图，引导用户用语音直接说想去的地点 ── */}
+            <GlassCard className="py-5 px-5 text-center">
+              <div className="text-2xl mb-1.5">🎙️</div>
+              <p className="text-sm font-medium text-charcoal/85">没有心仪的推荐？直接说出你想去的地方！</p>
+              <p className="text-xs text-muted/60 mt-1.5 leading-relaxed">
+                点上方麦克风，说「我想去外滩、黄浦江」，
+                <br />
+                地点会立刻加入你的已选卡片。
+              </p>
+            </GlassCard>
             {recommendError && (
               <p className="text-[11px] text-amber-600/90 text-center leading-relaxed">
                 （推荐接口刚才出了点小状况：{recommendError}）
