@@ -79,6 +79,10 @@ export default function TripPage() {
   // 🎨 自定义画布：placeholder 占位卡的内联编辑
   const [activePlaceholder, setActivePlaceholder] = useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = useState("");
+  // 📍 周边推荐（占位卡沙盒）
+  const [nearbyKey, setNearbyKey] = useState<string | null>(null);
+  const [nearbyList, setNearbyList] = useState<{ name: string; type: string; distance: number }[]>([]);
+  const [nearbyLoading, setNearbyLoading] = useState(false);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
   const [sharing, setSharing] = useState(false);
@@ -550,29 +554,115 @@ export default function TripPage() {
                                   setActivePlaceholder(null);
                                   setPlaceholderText("");
                                 };
+                                // 🤖 帮我想一个：结合当天上下文做局部 AI 推理
+                                const helpMeFill = () => {
+                                  if (adjusting) return;
+                                  const realItems = items.filter((x) => x.source !== "placeholder" && x.activity);
+                                  const before = realItems.filter((x) => (x.time || "") <= (item.time || "")).map((x) => x.activity);
+                                  const after = realItems.filter((x) => (x.time || "") > (item.time || "")).map((x) => x.activity);
+                                  const ctx = `该时段之前的安排：${before.join("、") || "无"}；之后的安排：${after.join("、") || "无"}`;
+                                  handleVoiceAdjust(
+                                    `请为第${day.dayIndex}天 ${item.time} 的空白时段智能推荐一个顺路活动（${ctx}），要求地理位置顺路、步行或短途可达、节奏合理，直接安排进这个时间槽，并在 note 里说明推荐理由（如「离上午的XX步行仅10分钟」）`
+                                  );
+                                  setActivePlaceholder(null);
+                                };
+                                // 📍 看看周边：用前后景点的坐标锚点搜 1.5km 内的真实去处
+                                const loadNearby = async () => {
+                                  if (nearbyLoading) return;
+                                  const withCoords = items.filter((x: any) => x.lng && x.lat && x.source !== "placeholder");
+                                  if (withCoords.length === 0) {
+                                    setNearbyKey(phKey);
+                                    setNearbyList([]);
+                                    return;
+                                  }
+                                  const beforeC = withCoords.filter((x: any) => (x.time || "") <= (item.time || ""));
+                                  const anchor: any = beforeC.length > 0 ? beforeC[beforeC.length - 1] : withCoords[0];
+                                  setNearbyLoading(true);
+                                  setNearbyKey(phKey);
+                                  try {
+                                    const res = await fetch("/api/poi-nearby", {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ lng: anchor.lng, lat: anchor.lat }),
+                                    });
+                                    const data = await res.json();
+                                    setNearbyList(data.pois ?? []);
+                                  } catch {
+                                    setNearbyList([]);
+                                  } finally {
+                                    setNearbyLoading(false);
+                                  }
+                                };
                                 return (
                                   <div key={i} className="py-2">
                                     {activePlaceholder === phKey ? (
-                                      <div className="flex gap-2 items-center rounded-xl border-2 border-dashed border-vibe-dusk/50 bg-white/60 px-3 py-2.5">
-                                        <input
-                                          autoFocus
-                                          value={placeholderText}
-                                          onChange={(e) => setPlaceholderText(e.target.value)}
-                                          onKeyDown={(e) => { if (e.key === "Enter") submitPlaceholder(); }}
-                                          placeholder="想安排什么？如：找家湖边咖啡馆发呆"
-                                          className="flex-1 bg-transparent text-sm text-charcoal outline-none placeholder:text-muted/50"
-                                        />
-                                        <button
-                                          onClick={submitPlaceholder}
-                                          disabled={adjusting || !placeholderText.trim()}
-                                          className="shrink-0 text-xs text-white bg-gradient-to-r from-vibe-sea to-vibe-dusk rounded-lg px-3 py-1.5 disabled:opacity-50"
-                                        >
-                                          {adjusting ? "安排中…" : "确认"}
-                                        </button>
+                                      <div className="rounded-xl border-2 border-dashed border-vibe-dusk/50 bg-white/60 px-3 py-2.5 space-y-2">
+                                        <div className="flex gap-2 items-center">
+                                          <input
+                                            autoFocus
+                                            value={placeholderText}
+                                            onChange={(e) => setPlaceholderText(e.target.value)}
+                                            onKeyDown={(e) => { if (e.key === "Enter") submitPlaceholder(); }}
+                                            placeholder="想安排什么？如：找家湖边咖啡馆发呆"
+                                            className="flex-1 bg-transparent text-sm text-charcoal outline-none placeholder:text-muted/50"
+                                          />
+                                          <button
+                                            onClick={submitPlaceholder}
+                                            disabled={adjusting || !placeholderText.trim()}
+                                            className="shrink-0 text-xs text-white bg-gradient-to-r from-vibe-sea to-vibe-dusk rounded-lg px-3 py-1.5 disabled:opacity-50"
+                                          >
+                                            {adjusting ? "安排中…" : "确认"}
+                                          </button>
+                                        </div>
+                                        <div className="flex gap-2">
+                                          <button
+                                            onClick={helpMeFill}
+                                            disabled={adjusting}
+                                            className="flex-1 py-1.5 rounded-lg bg-vibe-sea/10 border border-vibe-sea/30 text-xs text-vibe-sea font-medium hover:bg-vibe-sea/20 transition-colors disabled:opacity-50"
+                                          >
+                                            🤖 帮我想一个
+                                          </button>
+                                          <button
+                                            onClick={loadNearby}
+                                            disabled={nearbyLoading}
+                                            className="flex-1 py-1.5 rounded-lg bg-amber-50 border border-amber-300/50 text-xs text-amber-700 font-medium hover:bg-amber-100/60 transition-colors disabled:opacity-50"
+                                          >
+                                            {nearbyLoading && nearbyKey === phKey ? "查找中…" : "📍 看看周边"}
+                                          </button>
+                                        </div>
+                                        {nearbyKey === phKey && !nearbyLoading && nearbyList.length > 0 && (
+                                          <div className="flex flex-wrap gap-1.5 pt-1">
+                                            <p className="w-full text-[10px] text-muted/60">
+                                              🛎️ 已为您锁定该时段周边 1.5 公里内的优质去处，点一下直接填入：
+                                            </p>
+                                            {nearbyList.map((p) => (
+                                              <button
+                                                key={p.name}
+                                                disabled={adjusting}
+                                                onClick={() => {
+                                                  handleVoiceAdjust(
+                                                    `把第${day.dayIndex}天 ${item.time} 的空白时段安排为：去「${p.name}」（${p.type}，距前后行程约 ${p.distance} 米）`
+                                                  );
+                                                  setActivePlaceholder(null);
+                                                  setNearbyKey(null);
+                                                }}
+                                                className="inline-flex items-center gap-1 rounded-full bg-white border border-amber-300/60 px-2.5 py-1 text-xs text-charcoal/80 hover:bg-amber-50 transition-colors disabled:opacity-50"
+                                              >
+                                                {p.name}
+                                                <span className="text-[10px] text-muted/50">{p.distance}m</span>
+                                              </button>
+                                            ))}
+                                          </div>
+                                        )}
+                                        {nearbyKey === phKey && !nearbyLoading && nearbyList.length === 0 && (
+                                          <p className="text-[11px] text-muted/60 pt-1">
+                                            附近暂时没搜到合适的去处，试试「🤖 帮我想一个」或手动输入吧
+                                          </p>
+                                        )}
                                       </div>
                                     ) : (
                                       <button
-                                        onClick={() => { setActivePlaceholder(phKey); setPlaceholderText(""); }}
+                                        onClick={() => { setActivePlaceholder(phKey); setPlaceholderText(""); setNearbyKey(null); }}
                                         className="w-full rounded-xl border-2 border-dashed border-vibe-dusk/30 bg-white/30 py-3.5 px-3 flex items-center justify-center gap-2 text-sm text-vibe-dusk/60 hover:bg-white/50 hover:border-vibe-dusk/50 transition-colors"
                                       >
                                         <Plus className="w-4 h-4" />

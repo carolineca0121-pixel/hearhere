@@ -57,6 +57,10 @@ export default function DiscoverPage() {
     attraction: [], food: [], souvenir: [], hotel: [],
   });
   const [loading, setLoading] = useState(false);
+  // 🚀 已加载分类缓存标记 + 各分类请求中状态（Tab 切换 0ms 读缓存）
+  const loadedCatsRef = useRef<Set<DiscoverCategory>>(new Set());
+  const [pendingCats, setPendingCats] = useState<Set<DiscoverCategory>>(new Set());
+  const prefetchFiredRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const poiCoordsRef = useRef<Map<string, { lng: number; lat: number }>>(new Map());
   // 📷 用户手动移除的截图地名（不强行加回）；新增地名会自动蹦入
@@ -121,6 +125,7 @@ export default function DiscoverPage() {
   const loadCategory = useCallback(async (category: DiscoverCategory, mt?: string, cui?: string) => {
     if (!destination) return;
     setLoading(true);
+    setPendingCats((prev) => new Set(prev).add(category));
     try {
       const body: any = { destination, tags, category };
       if (category === "food") {
@@ -145,24 +150,33 @@ export default function DiscoverPage() {
         };
       });
       setAllCards((prev) => ({ ...prev, [category]: cards }));
+      loadedCatsRef.current.add(category);
     } catch (e) { console.warn("[discover]", e); }
-    finally { setLoading(false); }
+    finally {
+      setLoading(false);
+      setPendingCats((prev) => { const next = new Set(prev); next.delete(category); return next; });
+    }
   }, [destination, tags, selectedLocations]);
 
-  // 分类变化时，清空筛选并加载
+  // 分类变化时：已缓存的直接 0ms 读取，未缓存的才请求
   useEffect(() => {
-    if (_hydrated && destination) {
-      if (activeCategory === "food") {
-        // 美食：用当前筛选重新加载
-        const currentCards = allCards.food;
-        const hasCards = currentCards.length > 0;
-        // 有缓存且在相同筛选项下不重新加载
-        loadCategory(activeCategory, mealType || undefined, cuisine || undefined);
-      } else {
-        loadCategory(activeCategory);
-      }
+    if (!_hydrated || !destination) return;
+    if (loadedCatsRef.current.has(activeCategory)) return; // 🚀 缓存命中，0ms
+    if (activeCategory === "food") {
+      loadCategory("food", mealType || undefined, cuisine || undefined);
+    } else {
+      loadCategory(activeCategory);
     }
   }, [_hydrated, destination, activeCategory]);
+
+  // 🚀 进场即并发预加载全部 4 个分类（各自独立 serverless 调用，互不阻塞）
+  useEffect(() => {
+    if (!_hydrated || !destination || prefetchFiredRef.current) return;
+    prefetchFiredRef.current = true;
+    Promise.all(
+      (["attraction", "food", "souvenir", "hotel"] as DiscoverCategory[]).map((c) => loadCategory(c))
+    );
+  }, [_hydrated, destination, loadCategory]);
 
   // 筛选变化时重新加载美食
   useEffect(() => {
@@ -453,7 +467,7 @@ export default function DiscoverPage() {
       <div className="flex-1 px-4 py-4 space-y-3 pb-28">
         <p className="text-xs text-muted/70">{CAT_DESC[activeCategory]}</p>
 
-        {loading ? (
+        {(loading || pendingCats.has(activeCategory)) ? (
           <div className="space-y-2.5">
             {Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="bg-white/60 rounded-2xl p-3 animate-pulse">
@@ -535,6 +549,17 @@ export default function DiscoverPage() {
             </motion.div>
           </AnimatePresence>
         )}
+      </div>
+
+      {/* ── 🎨 常驻画布入口：推荐都不喜欢时的逃生舱 ── */}
+      <div className="px-4 pb-2 flex justify-center">
+        <button
+          onClick={handleCustomCanvas}
+          disabled={canvasCreating}
+          className="text-xs text-vibe-dusk/70 underline underline-offset-4 decoration-vibe-dusk/30 hover:text-vibe-dusk transition-colors disabled:opacity-50"
+        >
+          {canvasCreating ? "正在为你搭建画布…" : "🎨 都不喜欢？直接去开启画布"}
+        </button>
       </div>
 
       {/* ── 底部确认 ── */}

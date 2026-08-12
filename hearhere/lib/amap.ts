@@ -37,6 +37,7 @@ function loadAmapConfig(): AmapConfig {
 // ── 客户端 ────────────────────────────────────────────
 
 const ENDPOINT = "https://restapi.amap.com/v3/place/text";
+const AROUND_ENDPOINT = "https://restapi.amap.com/v3/place/around";
 let _config: AmapConfig | null = null;
 
 function getConfig(): AmapConfig {
@@ -276,4 +277,59 @@ export async function getWeather(destination: string): Promise<WeatherInfo> {
   }
 
   return result;
+}
+
+// ── 周边搜索（Page 4 占位卡「看看周边」沙盒功能） ─────────────
+
+export interface NearbyPOI {
+  name: string;
+  type: string;
+  address: string;
+  distance: number; // 米
+  lng: number;
+  lat: number;
+}
+
+/** 高德周边搜索：以坐标为中心，默认 1.5km 内的景点/咖啡/美食 */
+export async function searchNearbyPOI(params: {
+  lng: number;
+  lat: number;
+  radius?: number;
+  keywords?: string;
+}): Promise<NearbyPOI[]> {
+  const config = getConfig();
+  const url = new URL(AROUND_ENDPOINT);
+  url.searchParams.set("key", config.api_key);
+  url.searchParams.set("location", `${params.lng},${params.lat}`);
+  url.searchParams.set("radius", String(params.radius || 1500));
+  url.searchParams.set("keywords", params.keywords || "");
+  // 景点|咖啡馆|特色美食
+  url.searchParams.set("types", "110000|050500|050000");
+  url.searchParams.set("sortrule", "distance");
+  url.searchParams.set("offset", "10");
+  url.searchParams.set("page", "1");
+  url.searchParams.set("extensions", "base");
+  url.searchParams.set("output", "json");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeout * 1000);
+  try {
+    const res = await fetch(url.toString(), { signal: controller.signal });
+    if (!res.ok) throw new Error(`高德周边搜索 HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.status !== "1") throw new Error(`高德周边搜索失败：${data.info || "未知错误"}`);
+    return (data.pois || []).map((p: any) => {
+      const [lng, lat] = String(p.location || "").split(",").map(Number);
+      return {
+        name: p.name,
+        type: String(p.type || "").split(";").pop() || "",
+        address: p.address || "",
+        distance: Number(p.distance || 0),
+        lng,
+        lat,
+      };
+    }).filter((p: NearbyPOI) => p.name && p.lng && p.lat);
+  } finally {
+    clearTimeout(timer);
+  }
 }
