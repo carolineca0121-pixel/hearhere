@@ -137,6 +137,9 @@ export interface DayPlanItem {
   period?: string;    // 模糊时段（前端展示用）：早上/上午/下午/晚上
   lng?: number;        // 经度（坐标注入）
   lat?: number;        // 纬度（坐标注入）
+  cardId?: string;     // E1b：关联 preferences.selectedCards[].id（旧数据可能缺失，匹配时 title 兜底）
+  origin?: "ai" | "user"; // E1b：谁放置的；旧数据缺失视为 "user"（保护性默认）
+  userOverride?: boolean; // 用户明知时间冲突仍手动放置（user override 标记，非系统认为合理）
 }
 
 export interface TripGeneratePayload {

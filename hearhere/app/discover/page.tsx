@@ -9,6 +9,7 @@ import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
 import { useSessionStore } from "@/stores/session";
 import { getMicErrorMessage } from "@/lib/mic";
+import { wgs84ToGcj02 } from "@/lib/amap-types";
 
 type DiscoverCategory = "attraction" | "food" | "souvenir"; // 2.0: 酒店分类删除（品牌质量一般、可有可无）
 
@@ -87,7 +88,8 @@ export default function DiscoverPage() {
           tags,
           rawUserText: transcript,
           // 2.0：已选卡片随身带入行程（卡片池 + 打卡清单的数据源），画布骨架不受影响
-          selectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason })),
+          // location 必须保留（P4 地图标注与坐标注入的数据源）
+          selectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason, location: c.location })),
           selectedFoods: [],
           isCustomCanvas: true,
         }),
@@ -118,8 +120,13 @@ export default function DiscoverPage() {
     .filter(Boolean) as MapMarker[];
 
   // ── 加载推荐（带上筛选参数） ──
+  // P3 性能修复：同 category+参数的请求在途时去重（mount 时「分类 effect」与「预加载 effect」会重复触发 attraction）
+  const inFlightCatsRef = useRef<Set<string>>(new Set());
   const loadCategory = useCallback(async (category: DiscoverCategory, mt?: string, cui?: string) => {
     if (!destination) return;
+    const flightKey = `${category}|${mt ?? ""}|${cui ?? ""}`;
+    if (inFlightCatsRef.current.has(flightKey)) return; // 🚀 同一请求在途，直接跳过
+    inFlightCatsRef.current.add(flightKey);
     setLoading(true);
     setPendingCats((prev) => new Set(prev).add(category));
     try {
@@ -149,6 +156,7 @@ export default function DiscoverPage() {
       loadedCatsRef.current.add(category);
     } catch (e) { console.warn("[discover]", e); }
     finally {
+      inFlightCatsRef.current.delete(flightKey);
       setLoading(false);
       setPendingCats((prev) => { const next = new Set(prev); next.delete(category); return next; });
     }
@@ -259,6 +267,8 @@ export default function DiscoverPage() {
             reason: "你语音说要去的",
             category: "attraction",
             status: "selected",
+            // E1b：已有坐标必须进 selectedContent（此前只进页面内存 ref，刷新即丢，P4 地图/距离无数据）
+            location: p.lng && p.lat ? { lng: p.lng, lat: p.lat, address: p.address } : undefined,
           });
         }
       }
@@ -295,7 +305,10 @@ export default function DiscoverPage() {
     if (selectedIds.has(card.id)) { removeContentCard(card.id); }
     else {
       const coords = poiCoordsRef.current.get(card.id);
-      addContentCard({ id: card.id, title: card.name, description: card.description || card.address || "", reason: card.description || "推荐", category: card.category as any, status: "selected", tags: [], suitableFor: [], location: coords ? { lat: coords.lat, lng: coords.lng, address: card.address } : undefined });
+      // E1b 坐标统一：推荐卡坐标源为 WGS84（lib/amap.ts 转过），入库一律转 GCJ-02（高德原生坐标系），
+      // 与语音卡（原生 GCJ-02）保持同一规范。仅 rec-* 推荐卡走 handleToggle，语音/截图卡不经此路径。
+      const stored = coords && card.id.startsWith("rec-") ? wgs84ToGcj02(coords.lng, coords.lat) : coords;
+      addContentCard({ id: card.id, title: card.name, description: card.description || card.address || "", reason: card.description || "推荐", category: card.category as any, status: "selected", tags: [], suitableFor: [], location: stored ? { lat: stored.lat, lng: stored.lng, address: card.address } : undefined });
     }
   };
 
@@ -511,6 +524,16 @@ export default function DiscoverPage() {
 
         {(loading || pendingCats.has(activeCategory)) ? (
           <div className="space-y-2.5">
+            {/* ── P3 加载文案（A3）：明确告诉用户系统正在工作，避免误以为卡死 ── */}
+            <div className="flex items-center gap-2 px-1 pt-1 pb-0.5">
+              <div className="w-3.5 h-3.5 rounded-full border-2 border-vibe-sea/30 border-t-vibe-sea animate-spin shrink-0" />
+              <p className="text-xs text-muted/80">
+                {activeCategory === "attraction" ? "正在为你寻找适合的景点…"
+                  : activeCategory === "food" ? "正在为你寻找适合的美食…"
+                  : activeCategory === "souvenir" ? "正在为你挑选伴手礼…"
+                  : "正在为你加载…"}
+              </p>
+            </div>
             {Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="bg-white/60 rounded-2xl p-3 animate-pulse">
                 <div className="flex items-center gap-3">
@@ -657,6 +680,31 @@ export default function DiscoverPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ── 🎨 画布创建全局遮罩：创建期间阻塞一切交互，消灭「延迟跳转的劫持感」 ── */}
+      {canvasCreating && (
+        <div className="fixed inset-0 z-50 bg-parchment/80 backdrop-blur-sm flex items-center justify-center">
+          <GlassCard className="px-6 py-5 flex flex-col items-center gap-3 mx-6">
+            <div className="w-8 h-8 rounded-full border-2 border-vibe-sea/30 border-t-vibe-sea animate-spin" />
+            <p className="text-sm font-medium text-charcoal/85">正在为你搭建画布…</p>
+            <p className="text-[11px] text-muted/70">往返交通与酒店骨架生成中，完成后自动进入行程画布</p>
+          </GlassCard>
+        </div>
+      )}
+
+      {/* ── 画布创建失败提示（遮罩消失后全局可见，可关闭） ── */}
+      {!canvasCreating && canvasError && (
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 w-[min(92vw,360px)]">
+          <GlassCard className="px-4 py-3 flex items-center justify-between gap-2 text-xs">
+            <span className="text-red-600">⚠️ {canvasError}</span>
+            <button
+              onClick={() => setCanvasError(null)}
+              className="text-muted/60 hover:text-charcoal transition-colors shrink-0 px-1"
+              aria-label="关闭错误提示"
+            >✕</button>
+          </GlassCard>
+        </div>
+      )}
     </div>
   );
 }

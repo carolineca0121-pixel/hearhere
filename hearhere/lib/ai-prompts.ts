@@ -732,3 +732,71 @@ export function visionExtractPrompt(): string {
 
 只输出一个 JSON 对象。`;
 }
+
+// ── E3-2：AI 行程规划（P4 画布初稿） ─────────────────────────
+// 与 tripPrompt 的本质区别：这里不让 LLM 写攻略内容，只做「规划判断」——
+// 哪天/几点/哪张卡/停留多久/为什么/舍弃谁。身份与字段由代码（plan-normalizer）负责。
+
+export interface PlanPromptArgs {
+  destination: string;
+  tags: Partial<ExtractedTags>;
+  rawUserText?: string;
+  /** 用户已选卡片白名单（含真实 cardId 与坐标；无 id 的 legacy 卡 cardId 为 null） */
+  cards: { cardId: string | null; title: string; description?: string; reason?: string; location?: { lng?: number; lat?: number; address?: string } | null }[];
+  dayCount: number;
+  anchors: { day1EarliestHour: number; lastDayLatestHour: number };
+  /** 骨架确定性事实（代码生成，供 prompt  prose 使用） */
+  skeletonFacts: { goLabel?: string; goTime?: string; backLabel?: string; backTime?: string };
+}
+
+export function planPrompt(args: PlanPromptArgs): string {
+  const { destination, tags, rawUserText, cards, dayCount, anchors, skeletonFacts } = args;
+  const prefs = (tags.preferences ?? []).join("、") || "无";
+  const cons = (tags.constraints ?? []).join("、") || "无";
+  const cardsJson = JSON.stringify(
+    cards.map((c) => ({
+      cardId: c.cardId, // legacy 卡为 null
+      title: c.title,
+      description: c.description ?? "",
+      reason: c.reason ?? "",
+      location: c.location ?? null,
+    })),
+    null,
+    0
+  );
+  const hasLegacy = cards.some((c) => !c.cardId);
+
+  return `你是 HearHere 的旅行规划师。用户在 P3 已经【亲自选定】了想去的地点卡片，现在请你把这些卡片安排到 ${destination} 的 ${dayCount} 天时间轴上。
+
+# 旅行条件
+- 目的地：${destination}
+- 出发地：${tags.departure ?? "未知"}
+- 天数：${dayCount} 天
+- 人数：${tags.peopleCount ?? "未知"} 人${tags.tripType ? `（${tags.tripType}）` : ""}
+- 交通方式：${tags.transportation ?? "未知"}
+- 去程：${skeletonFacts.goTime ? `Day 1 ${skeletonFacts.goTime} ${skeletonFacts.goLabel ?? "出发"}` : "Day 1 出发"}（约 ${anchors.day1EarliestHour}:00 后才能在目的地开始活动）
+- 返程：${skeletonFacts.backTime ? `Day ${dayCount} ${skeletonFacts.backTime} ${skeletonFacts.backLabel ?? "返程"}` : `Day ${dayCount} 返程`}（${anchors.lastDayLatestHour}:00 之后不能再安排）
+- 偏好：${prefs}
+- 约束：${cons}
+${rawUserText ? `- 用户原话：「${rawUserText}」` : ""}
+
+# 可安排的卡片白名单（只能从中选择，禁止任何白名单外的地点）
+${cardsJson}
+
+# 你的任务（只做规划判断）
+对每张卡判断：安排到第几天、几点开始、大概停留多久、为什么；不适合本次行程的放入 unplaced 并给一句理由。
+- 节奏：${(tags.preferences ?? []).some((p) => /父母|老人|家庭/.test(p)) ? "陪父母出行，" : ""}每天 2-3 个主要安排为宜，上午一个下午一个，留出吃饭和休息间隙
+- 组合：地理位置相近的尽量安排在同一天相邻时段
+- 同名不同 cardId 的卡是两个独立对象，可以分别安排
+
+# 输出格式（严格 JSON，只输出 JSON 本身）
+{"placements":[{"dayIndex":1,"time":"14:00","cardId":"白名单中的cardId","durationMin":120,"note":"一句简短理由"}],"unplaced":[{"cardId":"白名单中的cardId","reason":"一句简短理由"}]}
+
+# 铁律（违反会被系统拒收）
+1. 禁止创造白名单之外的任何地点；禁止输出 lng/lat/activity（系统会从真实卡片填充）
+2. 必须用 cardId 原样引用，禁止修改${hasLegacy ? "；清单中 cardId 为 null 的旧卡片，改用 cardTitle 引用（仅此类卡允许）" : ""}
+3. dayIndex 必须是 1 到 ${dayCount} 的整数；time 必须是 "HH:MM" 24 小时制
+4. Day 1 不早于 ${anchors.day1EarliestHour}:00；Day ${dayCount} 不晚于 ${anchors.lastDayLatestHour}:00
+5. 同一张 cardId 只能出现一次；每天最多 4 张卡
+6. note/reason 控制在 30 字以内，不要散文，不要称呼用户`;
+}

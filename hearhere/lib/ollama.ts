@@ -6,6 +6,13 @@
  *
  * 优先使用 DeepSeek（DEEPSEEK_API_KEY 存在时），
  * 回退到硅基流动（SILICONFLOW_API_KEY）。
+ *
+ * E2 基础设施修复：
+ * 1. ollamaJson 解析顺序重写——根治「数组正则优先 + 贪婪跨界」导致
+ *    「对象中嵌套数组」被错误截取的问题（此前对象型输出 100% 解析失败）。
+ * 2. chat() 增加 AbortSignal 超时保护（LLM_TIMEOUT_MS，默认 45s）。
+ * 3. 可选 jsonMode（response_format: json_object），provider 拒绝时降级重试。
+ * 4. 可选单次 repair pass（默认关闭），不为修 JSON 无限调用 LLM。
  */
 
 export class LocalServiceError extends Error {
@@ -29,6 +36,9 @@ const SILICONFLOW_BASE_URL =
   process.env.SILICONFLOW_BASE_URL ?? "https://api.siliconflow.cn/v1";
 const SILICONFLOW_CHAT_MODEL =
   process.env.SILICONFLOW_CHAT_MODEL ?? "Qwen/Qwen2.5-32B-Instruct";
+
+/** 单次 LLM 调用超时（毫秒）。可用 LLM_TIMEOUT_MS 环境变量覆盖（测试/部署调优用）。 */
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS ?? 45000);
 
 function isPlaceholder(value: string): boolean {
   return !value || value.startsWith("请替换") || value.trim() === "";
@@ -82,8 +92,14 @@ function getProvider(): {
 
 // ── 底层调用 ──────────────────────────────────────────
 
-async function chat(prompt: string, maxTokens = 4096): Promise<string> {
+interface ChatOptions {
+  /** 请求 response_format: { type: "json_object" }。provider 拒绝（400）时自动降级重试一次。 */
+  jsonMode?: boolean;
+}
+
+async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promise<string> {
   const provider = getProvider();
+  const jsonMode = opts?.jsonMode === true;
 
   const tryChat = async (
     apiKey: string,
@@ -103,21 +119,48 @@ async function chat(prompt: string, maxTokens = 4096): Promise<string> {
 
     messages.push({ role: "user", content: prompt });
 
-    const body = {
-      model,
-      messages,
-      temperature: 0.7,
-      max_tokens: maxTokens,
-    };
+    const doFetch = (withJsonFormat: boolean) =>
+      fetch(baseUrl + "/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + apiKey,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.7,
+          max_tokens: maxTokens,
+          ...(withJsonFormat ? { response_format: { type: "json_object" } } : {}),
+        }),
+        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+      });
 
-    const res = await fetch(baseUrl + "/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + apiKey,
-      },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await doFetch(jsonMode);
+    } catch (e) {
+      if (e instanceof Error && e.name === "TimeoutError") {
+        throw new LocalServiceError(`${name} API 调用超时（>${LLM_TIMEOUT_MS}ms）`, name);
+      }
+      throw e;
+    }
+
+    // jsonMode  graceful fallback：provider 不接受 response_format 时降级重试一次
+    if (!res.ok && jsonMode && res.status === 400) {
+      const errText = await res.text().catch(() => "");
+      console.warn(
+        `[ollama] ${name} 不接受 response_format（${errText.slice(0, 120)}），降级为普通模式重试`
+      );
+      try {
+        res = await doFetch(false);
+      } catch (e) {
+        if (e instanceof Error && e.name === "TimeoutError") {
+          throw new LocalServiceError(`${name} API 调用超时（>${LLM_TIMEOUT_MS}ms）`, name);
+        }
+        throw e;
+      }
+    }
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -155,46 +198,82 @@ async function chat(prompt: string, maxTokens = 4096): Promise<string> {
   }
 }
 
-// ── JSON 模式 ─────────────────────────────────────────
+// ── JSON 提取（E2 重写：纯函数，可独立测试） ─────────────
+
+/** 去除 ```json ... ``` 或 ``` ... ``` 围栏；无围栏则原样 trim。 */
+export function stripCodeFence(text: string): string {
+  const m = text.match(/```(?:json|JSON)?\s*([\s\S]*?)```/);
+  if (m) return m[1].trim();
+  return text.trim();
+}
+
+/**
+ * 从 LLM 文本中解析 JSON。解析顺序（E2 根治方案）：
+ * 1. 去围栏后整体直接 JSON.parse（覆盖干净输出）；
+ * 2. 按「第一个结构字符」判定目标形态：
+ *    - 先出现 `[` → 数组优先提取（兼容纯数组 / 对象元素数组，推荐路由正是此形态）；
+ *    - 否则 → 对象优先提取（对象中嵌套数组时，贪婪匹配从首个 `{` 到末个 `}` 正好是完整对象）；
+ * 3. 另一种形态作为 fallback 再试一次；
+ * 4. 全部失败 → 抛 LocalServiceError（安全失败，绝不抛出不可控异常）。
+ */
+export function parseJsonFromText<T>(text: string): T {
+  const stripped = stripCodeFence(text);
+
+  // 1) 整体直接 parse
+  try {
+    return JSON.parse(stripped) as T;
+  } catch {
+    // 继续走提取
+  }
+
+  // 2) 形态判定 + 提取
+  const firstArr = stripped.indexOf("[");
+  const firstObj = stripped.indexOf("{");
+  const arrMatch = stripped.match(/\[[\s\S]*\]/);
+  const objMatch = stripped.match(/\{[\s\S]*\}/);
+  const preferArray =
+    firstArr !== -1 && (firstObj === -1 || firstArr < firstObj);
+  const candidates = preferArray
+    ? [arrMatch?.[0], objMatch?.[0]]
+    : [objMatch?.[0], arrMatch?.[0]];
+
+  for (const c of candidates) {
+    if (!c) continue;
+    try {
+      return JSON.parse(c) as T;
+    } catch {
+      // 试下一个候选
+    }
+  }
+
+  throw new LocalServiceError(
+    "无法从 LLM 响应中提取 JSON。原始输出（前 200 字）：" + text.slice(0, 200),
+    "llm-parse"
+  );
+}
 
 export async function ollamaJson<T>(
   prompt: string,
-  opts?: { maxTokens?: number }
+  opts?: { maxTokens?: number; jsonMode?: boolean; repair?: boolean }
 ): Promise<T> {
   const maxTokens = opts?.maxTokens ?? 4096;
-  const text = await chat(prompt, maxTokens);
-
-  const arrMatch = text.match(/\[[\s\S]*\]/);
-  const objMatch = text.match(/\{[\s\S]*\}/);
-  const candidate =
-    arrMatch?.[0] ??
-    objMatch?.[0] ??
-    tryRecoverTruncatedJson(text);
-
-  if (!candidate) {
-    throw new LocalServiceError(
-      "无法从 LLM 响应中提取 JSON。原始输出（前 200 字）：" + text.slice(0, 200),
-      "llm-parse"
-    );
-  }
+  const text = await chat(prompt, maxTokens, { jsonMode: opts?.jsonMode });
 
   try {
-    return JSON.parse(candidate) as T;
+    return parseJsonFromText<T>(text);
   } catch (e) {
-    const recovered = tryRecoverTruncatedJson(candidate);
-    if (recovered) {
-      try {
-        return JSON.parse(recovered) as T;
-      } catch {
-        // ignore
-      }
+    // 可选单次 repair pass（默认关闭）：把损坏的输出交给 LLM 修一次，绝不循环
+    if (opts?.repair) {
+      console.warn("[ollama] JSON 解析失败，执行单次 repair pass");
+      const repairedText = await chat(
+        "下面的内容本应是一个 JSON，但格式已损坏。请只输出修复后的合法 JSON 本身，不要输出任何解释、注释或额外文字：\n\n" +
+          text.slice(0, 3000),
+        maxTokens,
+        { jsonMode: true }
+      );
+      return parseJsonFromText<T>(repairedText);
     }
-    throw new LocalServiceError(
-      "LLM 返回的 JSON 解析失败：" +
-        (e instanceof Error ? e.message : "未知") +
-        "。原始输出（前 300 字）：" + text.slice(0, 300),
-      "llm-parse"
-    );
+    throw e;
   }
 }
 
@@ -265,14 +344,23 @@ export async function ollamaVisionJson<T>(
     max_tokens: maxTokens,
   };
 
-  const res = await fetch(baseUrl + "/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + apiKey,
-    },
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await fetch(baseUrl + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") {
+      throw new LocalServiceError(`视觉模型调用超时（>${LLM_TIMEOUT_MS}ms）`, "llm-vision");
+    }
+    throw e;
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -301,12 +389,4 @@ export async function ollamaVisionJson<T>(
       "llm-parse"
     );
   }
-}
-
-function tryRecoverTruncatedJson(text: string): string | null {
-  const start = text.indexOf("[");
-  if (start === -1) return null;
-  const lastBrace = text.lastIndexOf("}");
-  if (lastBrace <= start) return null;
-  return text.slice(start, lastBrace + 1) + "]";
 }

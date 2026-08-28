@@ -11,7 +11,7 @@
  *
  * 管道流程:
  *   用户标签 → LLM#1 生成搜索关键词 → 高德搜索真实 POI
- *   → 去重+质量过滤 → LLM#2 偏好排序 → LLM#3 写推荐语 → 返回
+ *   → 去重+质量过滤 → LLM#2 偏好排序+推荐语（合并为一次调用）→ 返回
  */
 
 import { NextResponse } from "next/server";
@@ -207,53 +207,98 @@ function getCategorySuffix(category: string, index: number): string {
   return suffixes[index % suffixes.length];
 }
 
-// ── LLM#2: 偏好排序 ───────────────────────────────────
-
-async function rankByPreference(
+// ── LLM#2+#3 合并：偏好排序 + 推荐语（P3 性能修复：3 次串行 LLM → 2 次） ─────────────
+// 行为契约（与合并前完全一致）：
+// - 排序：LLM 按匹配度 >=5 降序返回 index，未提及的按原顺序追加；LLM 失败 → 原顺序
+// - 推荐语：Map<name, ReasonData>，逐类别 outputSpec 不变；失败 → 空 Map（页面降级展示）
+// - pois.length <= 3 时不排序（与原 rankByPreference 跳过逻辑一致），但仍取推荐语
+async function rankAndDescribe(
   destination: string,
   preferences: string[],
-  pois: NormalizedPOI[]
-): Promise<NormalizedPOI[]> {
-  if (pois.length <= 3) return pois;
+  pois: NormalizedPOI[],
+  category: string
+): Promise<{ ranked: NormalizedPOI[]; reasons: Map<string, ReasonData> }> {
+  const reasons = new Map<string, ReasonData>();
+  if (pois.length === 0) return { ranked: pois, reasons };
 
-  const prefStr = preferences.join("、");
+  const prefStr = preferences.length > 0 ? preferences.join("、") : "无特殊偏好";
+  const crowdHint = /父母|爸妈|老人|长辈/.test(prefStr) ? "用户是和父母长辈出行" : "";
+  const catName = CATEGORY_NAMES[category] || category;
   const poiList = pois
     .map((p, i) => `${i}: ${p.name}（${p.type?.split(";")[0] || "未知"}，${p.address || ""}）`)
     .join("\n");
 
-  const prompt = `你是旅行推荐排序专家。用户去【${destination}】，偏好：${prefStr}。
+  // 推荐语质量要求：与原 generateReasons 的逐类别 outputSpec 完全一致
+  let outputSpec = "";
+  if (category === "attraction") {
+    outputSpec = `为每个景点写一段详细介绍（2-3 句，50-80 字），包含：景点特色、必看亮点、为什么适合这个用户。要有画面感，让人想去。`;
+  } else if (category === "food") {
+    outputSpec = `为每个餐厅写：
+1. description：一句推荐理由（≤30字），说明为什么适合这个用户
+2. recommendedDish：2-3 道必点推荐菜（用顿号分隔，如「招牌海鲜面、梭子蟹炒年糕」）`;
+  } else if (category === "souvenir") {
+    outputSpec = `为每个伴手礼写：
+1. description：一句介绍（≤25字），说明这是什么
+2. giftPitch：一句推荐话语（≤30字），说明为什么值得带（如「普陀山开光观音饼，送长辈特别有面子」）`;
+  } else if (category === "hotel") {
+    outputSpec = `为每个酒店写一句推荐理由（≤35字），包含：位置优势、适合人群、品牌特色。`;
+  } else {
+    outputSpec = `为每个写一句个性化推荐语（≤40字）。`;
+  }
 
-以下是从地图搜索到的真实地点，请根据「与用户偏好的匹配度」打分排序。
-为每个地点打分（1-10，10=完美匹配），然后按分数从高到低返回 index 列表。
+  const extraFields = category === "food"
+    ? `,"recommendedDish":"推荐菜"`
+    : category === "souvenir"
+      ? `,"giftPitch":"推荐话语"`
+      : "";
+
+  const prompt = `你是旅行推荐专家。用户去【${destination}】，偏好：${prefStr}。${crowdHint}
+
+以下是从地图搜索到的真实${catName}，请一次完成两件事：
+1. 按「与用户偏好的匹配度」打分（1-10，10=完美匹配），只保留 >=5 分的，按分数从高到低排序，最多输出 12 个；
+2. 为保留下来的每个地点写推荐内容。${outputSpec}
+要用小红书/大众点评的口吻——真实、有画面感、不套话。
 
 地点列表：
 ${poiList}
 
-只输出 JSON 数组（按分数从高到低的 index），如 [3, 0, 7, 1, ...]。
-不需要返回全部，只返回匹配度 >= 5 的，按分数降序。`;
+只输出 JSON 数组（按分数从高到低）：[{"index":0,"name":"地点名","description":"..."${extraFields}}]`;
 
   try {
-    const result = await ollamaJson<number[]>(prompt, { maxTokens: 512 });
+    const result = await ollamaJson<Array<{ index?: number; name?: string } & ReasonData>>(
+      prompt,
+      { maxTokens: 2048 }
+    );
     if (Array.isArray(result) && result.length > 0) {
-      const ranked: NormalizedPOI[] = [];
-      const used = new Set<number>();
-      for (const idx of result) {
-        if (typeof idx === "number" && idx >= 0 && idx < pois.length && !used.has(idx)) {
-          used.add(idx);
-          ranked.push(pois[idx]);
+      for (const r of result) {
+        if (r && typeof r.name === "string" && r.name) {
+          const { name, index, ...rest } = r;
+          reasons.set(name, rest);
         }
       }
-      // 追加未被 LLM 返回的（避免丢失数据）
-      for (let i = 0; i < pois.length; i++) {
-        if (!used.has(i)) ranked.push(pois[i]);
+      if (pois.length > 3) {
+        const ranked: NormalizedPOI[] = [];
+        const used = new Set<number>();
+        for (const r of result) {
+          const idx = r?.index;
+          if (typeof idx === "number" && idx >= 0 && idx < pois.length && !used.has(idx)) {
+            used.add(idx);
+            ranked.push(pois[idx]);
+          }
+        }
+        // 追加未被 LLM 返回的（避免丢失数据）——与原逻辑一致
+        for (let i = 0; i < pois.length; i++) {
+          if (!used.has(i)) ranked.push(pois[i]);
+        }
+        return { ranked, reasons };
       }
-      return ranked;
+      // pois.length <= 3：不排序（保持原顺序），只用推荐语
+      return { ranked: pois, reasons };
     }
   } catch (e) {
-    console.warn("[recommend] LLM ranking failed, using original order:", e);
+    console.warn("[recommend] LLM rankAndDescribe failed, using original order:", e);
   }
-
-  return pois;
+  return { ranked: pois, reasons };
 }
 
 // ── 目的地→Amap 搜索城市 ─────────────────────────────
@@ -275,70 +320,6 @@ interface ReasonData {
   description?: string;      // 详细介绍 / 推荐理由
   recommendedDish?: string;  // 美食推荐菜
   giftPitch?: string;        // 伴手礼推荐话语
-}
-
-async function generateReasons(
-  destination: string,
-  preferences: string[],
-  pois: NormalizedPOI[],
-  category: string
-): Promise<Map<string, ReasonData>> {
-  if (pois.length === 0) return new Map();
-
-  const list = pois.map((p) => `- ${p.name}（${p.type?.split(";")[0] || ""}）`).join("\n");
-  const catName = CATEGORY_NAMES[category] || category;
-  const prefStr = preferences.length > 0 ? preferences.join("、") : "无特殊偏好";
-  const crowdHint = /父母|爸妈|老人|长辈/.test(prefStr) ? "用户是和父母长辈出行" : "";
-
-  // 按类别定制输出要求
-  let outputSpec = "";
-  if (category === "attraction") {
-    outputSpec = `为每个景点写一段详细介绍（2-3 句，50-80 字），包含：景点特色、必看亮点、为什么适合这个用户。要有画面感，让人想去。`;
-  } else if (category === "food") {
-    outputSpec = `为每个餐厅写：
-1. description：一句推荐理由（≤30字），说明为什么适合这个用户
-2. recommendedDish：2-3 道必点推荐菜（用顿号分隔，如「招牌海鲜面、梭子蟹炒年糕」）`;
-  } else if (category === "souvenir") {
-    outputSpec = `为每个伴手礼写：
-1. description：一句介绍（≤25字），说明这是什么
-2. giftPitch：一句推荐话语（≤30字），说明为什么值得带（如「普陀山开光观音饼，送长辈特别有面子」）`;
-  } else if (category === "hotel") {
-    outputSpec = `为每个酒店写一句推荐理由（≤35字），包含：位置优势、适合人群、品牌特色。`;
-  } else {
-    outputSpec = `为每个写一句个性化推荐语（≤40字）。`;
-  }
-
-  const jsonShape = category === "food"
-    ? `[{"name":"地点名","description":"推荐理由","recommendedDish":"推荐菜"}]`
-    : category === "souvenir"
-    ? `[{"name":"地点名","description":"介绍","giftPitch":"推荐话语"}]`
-    : `[{"name":"地点名","description":"详细介绍"}]`;
-
-  const prompt = `你是旅行推荐助手。用户去${destination}，偏好：${prefStr}。${crowdHint}
-
-以下是真实${catName}列表。${outputSpec}
-要用小红书/大众点评的口吻——真实、有画面感、不套话。
-
-${list}
-
-只输出 JSON 数组：${jsonShape}`;
-
-  try {
-    const result = await ollamaJson<Array<{ name: string } & ReasonData>>(
-      prompt,
-      { maxTokens: 2048 }
-    );
-    const map = new Map<string, ReasonData>();
-    if (Array.isArray(result)) {
-      result.forEach((r) => {
-        const { name, ...rest } = r;
-        map.set(name, rest);
-      });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
 }
 
 // ── API ───────────────────────────────────────────────
@@ -378,12 +359,10 @@ export async function POST(request: Request) {
     pois = deduplicate(pois.filter((p) => !isTrash(p)));
     console.log(`[recommend] after dedup+filter: ${pois.length} POIs`);
 
-    // 4. LLM 偏好排序（新增）
-    pois = await rankByPreference(destination, preferences, pois);
-    console.log(`[recommend] after LLM ranking: ${pois.length} POIs`);
-
-    // 5. LLM 推荐语
-    const reasons = await generateReasons(destination, preferences, pois.slice(0, 12), category);
+    // 4. LLM 偏好排序 + 推荐语（P3 性能修复：两次串行合并为一次，行为契约不变）
+    const { ranked, reasons } = await rankAndDescribe(destination, preferences, pois, category);
+    pois = ranked;
+    console.log(`[recommend] after LLM rank+describe: ${pois.length} POIs, reasons=${reasons.size}`);
 
     // 6. 构建响应
     const items = pois.slice(0, 12).map((p) => {

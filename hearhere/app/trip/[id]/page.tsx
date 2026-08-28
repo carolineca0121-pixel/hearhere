@@ -7,6 +7,8 @@ import { MeshBackground } from "@/components/layout/mesh-background";
 import { BreathButton } from "@/components/voice/breath-button";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import type { VibeTheme, DayPlanItem } from "@/lib/types";
+import type { NormalizeResult } from "@/lib/plan-normalizer";
+import { occupiedIntervalsFor, minutesToTime, intervalOverlaps, timeToMinutes } from "@/lib/duration";
 import { getMicErrorMessage } from "@/lib/mic";
 import {
   Clock, Bus, Coins, Lightbulb, Sparkles, MapPin,
@@ -66,6 +68,51 @@ const SOURCE_COLORS: Record<string, string> = {
   recommended: "bg-amber-100 text-amber-700",
 };
 
+// === E1B-CONTRACT-HELPERS-BEGIN ===
+// E1b 数据契约：卡片身份匹配。cardId 优先，title 兜底旧数据（勿改动规则，ad-hoc 校验脚本会抽取本段实测）
+type PoolCard = {
+  id?: string;
+  title: string;
+  description?: string;
+  reason?: string;
+  location?: { lng?: number; lat?: number; address?: string };
+};
+/** 已放置项 vs 卡片池卡：item 带 cardId 时必须精确匹配（同名不同卡不误伤）；item 不带时按 title 兜底（兼容旧 trip） */
+function placedItemMatchesCard(
+  item: { cardId?: string; activity?: string },
+  card: { id?: string; title: string }
+): boolean {
+  if (item.cardId && card.id) return item.cardId === card.id;
+  return (item.activity ?? "") === card.title;
+}
+/** 两个已放置项是否同一项（removePlacedItem 用）：任一方有 cardId 就只按 cardId，双方都没有才按 title（旧行为） */
+function samePlacedItem(
+  a: { cardId?: string; activity?: string },
+  b: { cardId?: string; activity?: string }
+): boolean {
+  if (a.cardId || b.cardId) return Boolean(a.cardId && b.cardId && a.cardId === b.cardId);
+  return (a.activity ?? "") === (b.activity ?? "");
+}
+// === E1B-CONTRACT-HELPERS-END ===
+
+// === DURATION-OCCUPANCY-HELPERS（P4 时间轴按持续时长占位；解析逻辑单一来源 = lib/duration） ===
+/** UI 占位口径：用 minHours（保守最少占用）。规划/冲突口径在 lib/duration 用 maxHours。 */
+function continuationMapFor(items: DayPlanItem[]): Map<number, { title: string; until: string; source?: string }> {
+  const map = new Map<number, { title: string; until: string; source?: string }>();
+  for (const iv of occupiedIntervalsFor(items, 0, false)) {
+    const startH = Math.floor(iv.startMin / 60);
+    for (let h = startH + 1; h * 60 < iv.endMin; h++) {
+      map.set(h, { title: iv.label, until: minutesToTime(iv.endMin), source: iv.source });
+    }
+  }
+  return map;
+}
+// === DURATION-OCCUPANCY-HELPERS-END ===
+
+/** E2：语音全量调整入口开关。/adjust 语义是 LLM 全量重生成并覆盖画布，
+ *  在 Copilot（提案制）替代它之前保持 false。恢复入口只需改回 true。 */
+const VOICE_ADJUST_ENABLED = false;
+
 export default function TripPage() {
   const params = useParams();
   const router = useRouter();
@@ -85,9 +132,20 @@ export default function TripPage() {
   const [nearbyLoading, setNearbyLoading] = useState(false);
   // ── 2.0 攻略卡：可编辑时间轴 + 卡片池 + 打卡清单 ──
   const [editDays, setEditDays] = useState<Record<number, DayPlanItem[]>>({});
-  const [pickedCard, setPickedCard] = useState<string | null>(null);
-  const dragCardRef = useRef<string | null>(null);
+  const [pickedCard, setPickedCard] = useState<PoolCard | null>(null);
+  const dragCardRef = useRef<PoolCard | null>(null);
   const [savingDays, setSavingDays] = useState(false);
+  // E3-3：AI 自动规划状态机（idle/planning/failed）+ 失败类别（plan=LLM失败 / save=落库失败）+ 空结果轻提示
+  const [planState, setPlanState] = useState<"idle" | "planning" | "failed">("idle");
+  const [planErrorKind, setPlanErrorKind] = useState<"" | "plan" | "save">("");
+  const [planNotice, setPlanNotice] = useState<"" | "empty">(""); // 空规划轻提示
+  // 时间冲突提示（用户手动放置与占用区间冲突时；允许保留，但必须可见）
+  const [conflictNotice, setConflictNotice] = useState("");
+  useEffect(() => {
+    if (!conflictNotice) return;
+    const t = setTimeout(() => setConflictNotice(""), 6000);
+    return () => clearTimeout(t);
+  }, [conflictNotice]);
   const [checkedSpots, setCheckedSpots] = useState<Set<string>>(new Set());
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
@@ -133,6 +191,14 @@ export default function TripPage() {
     setEditDays(map);
   }, [trip]);
 
+  // ── E3-3：画布就绪后自动请求 AI 初稿（仅 pristine 画布；闸门与并发锁在 runAiPlan 内） ──
+  useEffect(() => {
+    if (!trip) return;
+    if (Object.keys(editDays).length === 0) return; // 等 editDays 初始化完成
+    triggerAiPlan();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trip, editDays]);
+
   // 打卡清单：按行程持久化到 localStorage
   useEffect(() => {
     try {
@@ -150,40 +216,191 @@ export default function TripPage() {
     });
   };
 
-  const persistDays = async (daysMap: Record<number, DayPlanItem[]>) => {
+  // E3-3：返回值标识 PUT 是否成功（AI 自动规划必须区分「规划失败」与「保存失败」）；
+  // 原有调用方（placeCard/removePlacedItem）忽略返回值，行为不变。
+  const persistDays = async (daysMap: Record<number, DayPlanItem[]>): Promise<boolean> => {
     setSavingDays(true);
     try {
-      await fetch(`/api/trips/${id}`, {
+      const res = await fetch(`/api/trips/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           days: Object.entries(daysMap).map(([dayIndex, items]) => ({ dayIndex: Number(dayIndex), items })),
         }),
       });
-    } catch { /* 静默 */ } finally { setSavingDays(false); }
+      return res.ok;
+    } catch {
+      return false;
+    } finally { setSavingDays(false); }
   };
 
   // 把卡片池中的卡放进某天某小时（同一地点重复放置会自动移动）
-  const placeCard = (dayIndex: number, hour: number, title: string) => {
+  // E1b：接收完整卡片，写入 cardId/origin/lng/lat（activity 用卡片原始 title，坐标从 selectedCards.location 复制）
+  // 冲突策略：允许放置（用户主权），但与已占用区间（交通等长项）冲突时给出明确警告并打 userOverride 标记
+  const placeCard = (dayIndex: number, hour: number, card: PoolCard) => {
     const next = { ...editDays };
-    const items = (next[dayIndex] ?? []).filter((it) => it.activity !== title);
+    const items = (next[dayIndex] ?? []).filter((it) => !placedItemMatchesCard(it, card));
+    // 冲突检测：放置时段（按 1h 估）与已有占用区间（maxHours 口径）是否相交
+    const startMin = hour * 60;
+    const conflict = occupiedIntervalsFor(items, dayIndex, true)
+      .find((iv) => intervalOverlaps(startMin, 60, iv));
     items.push({
       time: `${String(hour).padStart(2, "0")}:00`,
-      activity: title,
+      activity: card.title,
       source: "selected_card",
+      ...(card.id ? { cardId: card.id } : {}),
+      origin: "user",
+      ...(conflict ? { userOverride: true } : {}),
+      ...(card.location?.lng != null && card.location?.lat != null
+        ? { lng: card.location.lng, lat: card.location.lat }
+        : {}),
     });
     items.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
     next[dayIndex] = items;
     setEditDays(next);
     setPickedCard(null);
+    if (conflict) {
+      setConflictNotice(
+        `⚠️「${card.title}」与「${conflict.label}」（${minutesToTime(conflict.startMin)}-${minutesToTime(conflict.endMin)}）时间冲突，已按你的选择保留，可再调整`
+      );
+    }
     persistDays(next);
   };
 
-  const removePlacedItem = (dayIndex: number, title: string) => {
+  // E1b：按身份移除（cardId 优先，title 兜底旧数据），同名不同卡的项不再互相误伤
+  const removePlacedItem = (dayIndex: number, target: DayPlanItem) => {
     const next = { ...editDays };
-    next[dayIndex] = (next[dayIndex] ?? []).filter((it) => it.activity !== title);
+    next[dayIndex] = (next[dayIndex] ?? []).filter((it) => !samePlacedItem(it, target));
     setEditDays(next);
     persistDays(next);
+  };
+
+  // ── E3-3：AI 初稿自动规划（首入 pristine 画布时触发一次） ──
+  // 契约：/plan 只读返回 NormalizeResult；这里只负责「应用 + 落库 + 状态反馈」。
+  const planInFlightRef = useRef(false);   // 并发锁（StrictMode 双挂载/快速重入）
+  const planAutoDoneRef = useRef(false);   // 本页面生命周期内自动触发只试一次
+
+  /** 应用 AI placements：一次性构造完整 nextDays（禁止按天连续 setEditDays），一次 PUT 落库。 */
+  const applyAiPlacements = async (result: NormalizeResult): Promise<boolean> => {
+    const placed = Object.entries(result.placementsByDay ?? {}).flatMap(([d, items]) =>
+      (items ?? []).map((item) => ({ dayIndex: Number(d), item }))
+    );
+    if (placed.length === 0) return false; // 空结果：不动画布（调用方按「轻提示」处理，不算失败）
+
+    // 客户端白名单再校验一层：cardId → 真实 selectedCard，activity/坐标以真实卡为准重写
+    // （服务端 normalizeAiPlan 已做过，这里是第二道防线：不信任任何网络往返内容）
+    let whitelist: PoolCard[] = [];
+    try {
+      const pref = JSON.parse(trip?.preferences || "{}");
+      whitelist = (Array.isArray(pref.selectedCards) ? pref.selectedCards : [])
+        .filter((c: any) => c && typeof c.title === "string" && c.title);
+    } catch { whitelist = []; }
+
+    const next: Record<number, DayPlanItem[]> = {};
+    for (const [d, items] of Object.entries(editDays)) {
+      // D2：成功应用非空 plan → 拆除整趟 placeholder 脚手架；transport/rest/其他一律保留
+      next[Number(d)] = (items ?? []).filter((it) => it?.source !== "placeholder");
+    }
+    for (const { dayIndex, item } of placed) {
+      let finalItem = item;
+      if (item.cardId) {
+        const card = whitelist.find((c) => c.id === item.cardId);
+        if (!card) continue; // 非白名单 cardId → 丢弃（双保险，不进画布）
+        // activity/lng/lat 以真实卡为准（AI 无权决定）；source/origin 强制契约值
+        finalItem = {
+          ...item,
+          activity: card.title,
+          source: "selected_card",
+          origin: "ai",
+          ...(card.location?.lng != null && card.location?.lat != null
+            ? { lng: card.location.lng, lat: card.location.lat }
+            : {}),
+        };
+      }
+      const dayItems = next[dayIndex] ?? (next[dayIndex] = []);
+      // 用户安排优先：画布已有同 cardId 项 → 跳过（不覆盖/不改写/不重复）
+      if (finalItem.cardId && dayItems.some((ex) => ex.cardId && ex.cardId === finalItem.cardId)) continue;
+      // 防御跨天重复（normalizer 已保证一卡一次，此处双保险）
+      if (finalItem.cardId && Object.values(next).flat().some((ex) => ex.cardId && ex.cardId === finalItem.cardId)) continue;
+      // AI 的 day/time 原样使用，不重算不打平（14:30 必须仍是 14:30）
+      dayItems.push(finalItem);
+      dayItems.sort((a, b) => (a.time || "").localeCompare(b.time || "")); // 复用现有排序规则
+    }
+    // 防御：白名单过滤后实际无任何可应用项 → 视为空结果，不动画布
+    const appliedCount = Object.values(next).flat().filter((it) => it?.origin === "ai").length;
+    if (appliedCount === 0) return false;
+    setEditDays(next);
+    return await persistDays(next);
+  };
+
+  /** 实际执行规划（自动触发与手动重试共用；内含幂等闸门与并发锁） */
+  const runAiPlan = async () => {
+    if (!trip) return;
+    if (planInFlightRef.current) return;
+    // D1 用户主权：画布已有任何 selected_card（user/ai/legacy 无 origin）→ 不自动接管
+    const hasAnyPlaced = Object.values(editDays).flat().some((it) => it?.source === "selected_card");
+    if (hasAnyPlaced) return;
+    let hasCards = false;
+    try {
+      const pref = JSON.parse(trip.preferences || "{}");
+      hasCards = Array.isArray(pref.selectedCards) && pref.selectedCards.length > 0;
+    } catch { /* ignore */ }
+    if (!hasCards) return; // 无可规划卡片：不调 /plan、不报错、保持骨架
+
+    planInFlightRef.current = true;
+    setPlanState("planning");
+    setPlanErrorKind("");
+    try {
+      const res = await fetch(`/api/trips/${id}/plan`, { method: "POST" });
+      if (!res.ok) throw new Error(`plan-http-${res.status}`);
+      const result = (await res.json()) as NormalizeResult;
+      const placedCount = Object.values(result.placementsByDay ?? {}).flat().length;
+      if (placedCount === 0) {
+        // 空规划：合法结果而非错误——不动画布、不 PUT、给轻提示
+        setPlanState("idle");
+        setPlanNotice("empty");
+        return;
+      }
+      const ok = await applyAiPlacements(result);
+      if (ok) {
+        setPlanState("idle");
+        setPlanNotice("");
+      } else {
+        // PUT 失败：editDays 已是 optimistic 更新状态（现有保存模式），明确提示保存失败
+        setPlanState("failed");
+        setPlanErrorKind("save");
+      }
+    } catch {
+      // /plan 失败（LLM/网络/503）：画布零改动，骨架与 placeholder 原样
+      setPlanState("failed");
+      setPlanErrorKind("plan");
+    } finally {
+      planInFlightRef.current = false;
+    }
+  };
+
+  /** 自动触发入口：仅 pristine 画布、仅一次 */
+  const triggerAiPlan = () => {
+    if (planAutoDoneRef.current) return;
+    planAutoDoneRef.current = true;
+    void runAiPlan();
+  };
+
+  /** 手动重试：plan 失败重跑规划；save 失败仅重试落库（不重跑 LLM） */
+  const retryAiPlan = () => {
+    if (planErrorKind === "save") {
+      if (planInFlightRef.current) return;
+      planInFlightRef.current = true;
+      setPlanState("planning");
+      void persistDays(editDays).then((ok) => {
+        planInFlightRef.current = false;
+        if (ok) { setPlanState("idle"); setPlanErrorKind(""); }
+        else setPlanState("failed");
+      });
+      return;
+    }
+    // runAiPlan 内的 hasAnyPlaced 闸门仍然生效：用户失败后已手动放卡 → 不再调 /plan
+    void runAiPlan();
   };
 
   // ── 分享 ──
@@ -284,37 +501,30 @@ export default function TripPage() {
   })();
 
   // ── 解析所有 POI 坐标用于地图 ──
+  // E1b：改读 editDays（而非初始 trip.itineraries）——放置/删除卡片后地图 marker 实时更新，不再依赖刷新。
+  // 去重键 cardId 优先（同名不同卡各自出 marker），title 兜底旧数据。
   const allMarkers: MapMarker[] = [];
   const allPoiNames = new Set<string>();
 
-  if (trip) {
-    [...(trip.itineraries ?? [])]
-      .sort((a, b) => a.dayIndex - b.dayIndex)
-      .forEach((day) => {
-        try {
-          const items = JSON.parse(day.content) as (DayPlanItem & {
-            source?: string;
-            recommendedDish?: string;
-            lng?: number;
-            lat?: number;
-          })[];
-          items.forEach((item, i) => {
-            if (item.lng && item.lat && !allPoiNames.has(item.activity)) {
-              allPoiNames.add(item.activity);
-              const cat = item.source === "food" ? "food" : item.source === "rest" ? "hotel" : "attraction";
-              allMarkers.push({
-                id: `day${day.dayIndex}-${i}`,
-                name: item.activity,
-                lng: item.lng,
-                lat: item.lat,
-                category: cat,
-                color: CATEGORY_MARKER_COLORS[cat] || "#6B7280",
-              });
-            }
+  Object.entries(editDays)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .forEach(([dayIndex, items]) => {
+      (items ?? []).forEach((item, i) => {
+        const dedupeKey = item.cardId ?? item.activity;
+        if (item.lng && item.lat && !allPoiNames.has(dedupeKey)) {
+          allPoiNames.add(dedupeKey);
+          const cat = item.source === "food" ? "food" : item.source === "rest" ? "hotel" : "attraction";
+          allMarkers.push({
+            id: `day${dayIndex}-${i}`,
+            name: item.activity,
+            lng: item.lng,
+            lat: item.lat,
+            category: cat,
+            color: CATEGORY_MARKER_COLORS[cat] || "#6B7280",
           });
-        } catch { /* ignore parse errors */ }
+        }
       });
-  }
+    });
 
   // ── 语音调整 ──
   const handleVoiceAdjust = useCallback(async (transcript: string) => {
@@ -359,21 +569,34 @@ export default function TripPage() {
   let overview = "";
   let travelTips: string[] = [];
   let planningThought = "";
-  let prefSelectedCards: { title?: string }[] = [];
+  // E1b：读取完整卡片身份（id/title/description/reason/location）；旧数据缺 id/location 也可正常打开
+  let prefSelectedCards: PoolCard[] = [];
   try {
     const pref = JSON.parse(trip.preferences);
     title = pref.title ?? "";
     overview = pref.overview ?? "";
     travelTips = pref.travelTips ?? [];
     planningThought = pref.planningThought ?? "";
-    prefSelectedCards = Array.isArray(pref.selectedCards) ? pref.selectedCards : [];
+    prefSelectedCards = (Array.isArray(pref.selectedCards) ? pref.selectedCards : [])
+      .filter((c: any) => c && typeof c.title === "string" && c.title.length > 0)
+      .map((c: any) => ({
+        id: typeof c.id === "string" ? c.id : undefined,
+        title: c.title as string,
+        description: c.description,
+        reason: c.reason,
+        location: c.location && typeof c.location.lng === "number" && typeof c.location.lat === "number"
+          ? { lng: c.location.lng, lat: c.location.lat, address: c.location.address }
+          : undefined,
+      }));
   } catch { /* ignore */ }
   const displayTitle = title || `${trip.destination} · 我的旅行攻略`;
 
-  // ── 2.0 攻略卡：卡片池 = 已选卡片 - 已排入时间轴的 ──
-  const selectedCardTitles: string[] = prefSelectedCards.map((c) => c?.title).filter(Boolean) as string[];
-  const usedTitles = new Set(Object.values(editDays).flat().map((it: any) => it?.activity).filter(Boolean));
-  const cardPool = selectedCardTitles.filter((t) => !usedTitles.has(t));
+  // ── 2.0 攻略卡：卡片池 = 已选卡片 - 已排入时间轴的（E1b：cardId 优先，title 兜底旧数据） ──
+  const selectedCardTitles: string[] = prefSelectedCards.map((c) => c.title);
+  const placedItems = Object.values(editDays).flat();
+  const cardPool = prefSelectedCards.filter(
+    (card) => !placedItems.some((it: any) => placedItemMatchesCard(it ?? {}, card))
+  );
   const totalExpenseAmount = expenses.reduce((s, e) => s + e.amount, 0);
 
   const sortedDays = [...(trip.itineraries ?? [])].sort((a, b) => a.dayIndex - b.dayIndex);
@@ -561,6 +784,48 @@ export default function TripPage() {
           </div>
         )}
 
+        {/* ── E3-3 AI 规划状态条（规划中/失败重试/空结果提示） ── */}
+        {planState === "planning" && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-2.5 flex items-center gap-2 text-xs text-charcoal/70">
+              <span className="animate-pulse">✨</span>
+              <span>AI 正在根据你选的卡片规划行程…</span>
+            </GlassCard>
+          </div>
+        )}
+        {planState === "failed" && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
+              <span className="text-red-600">
+                ⚠️ {planErrorKind === "save"
+                  ? "AI 已生成规划，但保存失败，请重试。"
+                  : "AI 暂时无法完成规划，画布已保留当前内容。"}
+              </span>
+              <button
+                onClick={retryAiPlan}
+                className="shrink-0 rounded-full bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white px-3 py-1 text-[11px] font-medium"
+              >
+                重试
+              </button>
+            </GlassCard>
+          </div>
+        )}
+        {planState === "idle" && planNotice === "empty" && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-2.5 text-xs text-muted/70">
+              暂时没有适合自动安排的已选地点，画布由你自由安排 🧺
+            </GlassCard>
+          </div>
+        )}
+        {/* 时间冲突提示（user override 可见警告，6s 自动消失） */}
+        {conflictNotice && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-2.5 text-xs text-amber-700 bg-amber-50/70 border-amber-200/60">
+              {conflictNotice}
+            </GlassCard>
+          </div>
+        )}
+
         {/* ── 🧺 待安排卡片池（点选或拖入下方时间轴） ── */}
         {cardPool.length > 0 && (
           <div className="px-4 pt-3">
@@ -570,21 +835,29 @@ export default function TripPage() {
                 <span className="text-muted/60 font-normal ml-1">点一下选中，再点下方时间轴空格放入（桌面端可直接拖拽）</span>
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {cardPool.map((t) => (
-                  <button
-                    key={t}
-                    draggable
-                    onDragStart={() => { dragCardRef.current = t; }}
-                    onClick={() => setPickedCard(pickedCard === t ? null : t)}
-                    className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs transition-all ${
-                      pickedCard === t
-                        ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-md scale-105"
-                        : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white"
-                    }`}
-                  >
-                    {t}
-                  </button>
-                ))}
+                {cardPool.map((card) => {
+                  const cardKey = card.id ?? card.title;
+                  const isPicked = pickedCard
+                    ? pickedCard.id && card.id
+                      ? pickedCard.id === card.id
+                      : pickedCard.title === card.title
+                    : false;
+                  return (
+                    <button
+                      key={cardKey}
+                      draggable
+                      onDragStart={() => { dragCardRef.current = card; }}
+                      onClick={() => setPickedCard(isPicked ? null : card)}
+                      className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs transition-all ${
+                        isPicked
+                          ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-md scale-105"
+                          : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white"
+                      }`}
+                    >
+                      {card.title}
+                    </button>
+                  );
+                })}
               </div>
             </GlassCard>
           </div>
@@ -604,6 +877,8 @@ export default function TripPage() {
             const minHour = Math.min(6, ...(itemHours.length > 0 ? itemHours : [6]));
             const maxHour = Math.max(23, ...(itemHours.length > 0 ? itemHours : [23]));
             const hours = Array.from({ length: maxHour - minHour + 1 }, (_, i) => minHour + i);
+            // 长项（duration>1h）的跨小时延续占位表
+            const continuationMap = continuationMapFor(dayItems);
             const dayWeather = weather?.forecasts?.[day.dayIndex - 1];
 
             return (
@@ -671,6 +946,7 @@ export default function TripPage() {
                       <div>
                         {hours.map((h) => {
                           const rowItems = dayItems.filter((it: any) => hourOf(it.time) === h);
+                          const continuation = continuationMap.get(h);
                           const canPlace = pickedCard !== null;
                           return (
                             <div
@@ -691,10 +967,24 @@ export default function TripPage() {
                                 {String(h).padStart(2, "0")}:00
                               </span>
                               <div className="flex-1 flex flex-wrap gap-1.5 items-center">
-                                {rowItems.length === 0 ? (
-                                  <span className={`text-[11px] ${canPlace ? "text-vibe-sea font-medium" : "text-muted/25"}`}>
-                                    {canPlace ? `＋ 点击放入「${pickedCard}」` : "·"}
+                                {/* 长项跨小时延续条：让 3 小时的交通真实占住 3 个小时格 */}
+                                {continuation && (
+                                  <span className={`inline-flex items-center gap-1 rounded-lg px-2 py-0.5 text-[10px] border border-dashed ${
+                                    continuation.source === "transport"
+                                      ? "bg-blue-50/60 border-blue-200/60 text-blue-700/80"
+                                      : continuation.source === "rest"
+                                        ? "bg-purple-50/60 border-purple-200/60 text-purple-700/80"
+                                        : "bg-vibe-sea/5 border-vibe-sea/25 text-charcoal/60"
+                                  }`}>
+                                    ⏳ {continuation.title} · 进行中（至 {continuation.until}）
                                   </span>
+                                )}
+                                {rowItems.length === 0 ? (
+                                  (!continuation || canPlace) && (
+                                    <span className={`text-[11px] ${canPlace ? "text-vibe-sea font-medium" : "text-muted/25"}`}>
+                                      {canPlace && pickedCard ? `＋ 点击放入「${pickedCard.title}」` : "·"}
+                                    </span>
+                                  )
                                 ) : (
                                   rowItems.map((it: any, idx: number) => {
                                     const fixed = it.source === "transport" || it.source === "rest";
@@ -717,7 +1007,7 @@ export default function TripPage() {
                                         {it.cost && <span className="text-[10px] opacity-60">{it.cost}</span>}
                                         {!fixed && (
                                           <button
-                                            onClick={(e) => { e.stopPropagation(); removePlacedItem(day.dayIndex, it.activity); }}
+                                            onClick={(e) => { e.stopPropagation(); removePlacedItem(day.dayIndex, it); }}
                                             className="ml-0.5 text-muted/50 hover:text-red-500"
                                           >
                                             ×
@@ -909,6 +1199,12 @@ export default function TripPage() {
         </div>
 
         {/* ── 🆕 语音调整 —— 呼吸按钮 ── */}
+        {/* E2 临时隐藏：该入口调用 /api/trips/[id]/adjust，其语义是「LLM 全量重生成并覆盖整个画布」。
+            此前因 ollamaJson 解析缺陷该接口 100% 失败（功能实际已死）；
+            E2 修复 parser 后它会突然“复活”并覆盖用户手动排好的画布（origin=user 的项也会被抹掉）。
+            故在 E3/E4 Copilot（提案制、不覆盖用户内容）落地前，先隐藏入口。
+            API 保留未删，handleVoiceAdjust 逻辑保留未改。 */}
+        {VOICE_ADJUST_ENABLED && (
         <motion.div
           initial={{ y: 30, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
@@ -948,6 +1244,7 @@ export default function TripPage() {
             onStop={() => { /* recorder auto-stops */ }}
           />
         </motion.div>
+        )}
 
         {/* ── 底部导航 ── */}
         <div className="px-4 pb-6 pt-2 flex gap-2">

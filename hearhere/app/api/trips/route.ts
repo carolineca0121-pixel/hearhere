@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { ollamaJson, LocalServiceError } from "@/lib/ollama";
 import { harmonyPrompt, tripPrompt } from "@/lib/ai-prompts";
 import { inferVibeTheme, VIBE_COLORS } from "@/lib/vibe";
-import { getDrivingRoute } from "@/lib/amap-direction";
+import { getDrivingRoute, type DrivingRoute } from "@/lib/amap-direction";
 import type {
   ExtractedTags,
   HarmonyResult,
@@ -13,6 +13,10 @@ import type {
   OmittedSpot,
   VibeTheme,
 } from "@/lib/types";
+
+// Vercel 免费版 Serverless 默认 10s 超时；常规模式要串行 LLM 调用，必须放宽
+// （与 /api/recommend 的 maxDuration=60 对齐）
+export const maxDuration = 60;
 
 interface TripGenerateResponse {
   planningThought?: string;
@@ -35,6 +39,379 @@ interface TripGenerateResponse {
       recommendedDish?: string;
     }[];
   }[];
+}
+
+/**
+ * 🎨 2.0 自定义画布骨架 —— 纯代码确定性生成，不调用任何 LLM。
+ *
+ * 骨架只负责物理结构，不替用户决定景点顺序：
+ *   Day 1   = 去程交通（对齐出发时间）+（有酒店信息时）入住 rest + 留白 placeholder
+ *   中间天  = 留白 placeholder
+ *   最后一天 = 上午留白 placeholder + 返程交通（对齐返程时间）
+ * 绝不编造任何景点/餐厅——时间轴上的空白由用户在 P4 亲手填充。
+ *
+ * 时间模型与后处理层（路途强制注入）完全同一套映射，不新建第二套结构。
+ */
+function buildCanvasSkeleton(args: {
+  destination: string;
+  tags: ExtractedTags;
+  drivingRoute: DrivingRoute | null;
+}): TripGenerateResponse {
+  const { destination, tags, drivingRoute } = args;
+
+  // 天数推断：与后处理「天数兜底」保持同一公式
+  let dayCount = tags.days ?? 2;
+  const dates = tags.dates?.toLowerCase() ?? "";
+  if (/三天|3天|三日|3日/.test(dates)) dayCount = 3;
+  else if (/四天|4天|四日|4日/.test(dates)) dayCount = 4;
+  else if (/五天|5天|五日|5日/.test(dates)) dayCount = 5;
+
+  const departure = tags.departure || "";
+  const transportation = tags.transportation || "";
+  const hasLeg = Boolean(departure && transportation);
+
+  // 出发/返程时刻：自定义精确时间优先，否则按模糊标签映射
+  const depHourMap: Record<string, number> = { 早上出发: 9, 中午出发: 13, 下午出发: 15 };
+  const retHourMap: Record<string, number> = { 午饭后返程: 13, 一早返程: 9 };
+  // 容错：未命中枚举的自由文本（如「午饭后出发」）按关键词推断，不再静默回退 9:00
+  const resolveHour = (label: string | undefined, map: Record<string, number>, dft: number): number => {
+    if (!label) return dft;
+    const exact = map[label];
+    if (exact != null) return exact;
+    if (/一早|凌晨|早上|上午|早晨/.test(label)) return 9;
+    if (/午|中午|饭后/.test(label)) return 13;
+    if (/下午/.test(label)) return 15;
+    if (/晚|夜/.test(label)) return 19;
+    return dft;
+  };
+  const depHour = resolveHour(tags.departureTime, depHourMap, 9);
+  const retHour = resolveHour(tags.returnTime, retHourMap, 13);
+  const depTimeStr =
+    tags.departureTimeVal && /^\d{1,2}:\d{2}$/.test(tags.departureTimeVal)
+      ? tags.departureTimeVal
+      : `${String(depHour).padStart(2, "0")}:00`;
+  const retTimeStr =
+    tags.returnTimeVal && /^\d{1,2}:\d{2}$/.test(tags.returnTimeVal)
+      ? tags.returnTimeVal
+      : `${String(retHour).padStart(2, "0")}:00`;
+
+  // 路途时长/费用：有真实驾车数据用真实，否则按交通方式估计（与后处理注入同口径）
+  const travelDuration =
+    drivingRoute?.durationText ||
+    (transportation === "自驾"
+      ? "约 3-4 小时"
+      : transportation === "飞机"
+        ? "约 3-4 小时（含候机）"
+        : "约 1-3 小时");
+  const travelHours =
+    drivingRoute?.durationHours ??
+    (transportation === "自驾" || transportation === "飞机" ? 3.5 : 2);
+  const travelCost = drivingRoute?.tolls
+    ? `过路费约 ${drivingRoute.tolls} 元`
+    : transportation === "自驾"
+      ? "油费+过路费约 150-300 元"
+      : "视车次/航班而定";
+
+  const padHour = (h: number) =>
+    `${String(Math.min(22, Math.max(6, Math.round(h)))).padStart(2, "0")}:00`;
+  const depHourNum = parseInt(depTimeStr.split(":")[0], 10) || 9;
+  const arrivalHour = depHourNum + travelHours;
+
+  const placeholder = (time: string, note: string) => ({
+    time,
+    activity: "[ ➕ 添加活动 ]",
+    note,
+    source: "placeholder",
+  });
+
+  const goLabel =
+    transportation === "自驾"
+      ? `${departure}自驾前往${destination}`
+      : `${departure}${transportation}前往${destination}`;
+  const backLabel = `${destination}${transportation}返回${departure}`;
+
+  const days: TripGenerateResponse["days"] = [];
+  for (let d = 1; d <= dayCount; d++) {
+    const items: TripGenerateResponse["days"][number]["items"] = [];
+
+    // Day 1 去程交通
+    if (d === 1 && hasLeg) {
+      items.push({
+        time: depTimeStr,
+        activity: goLabel,
+        note: drivingRoute
+          ? `全程约 ${drivingRoute.distanceKm} 公里，建议每开 2 小时在服务区休整`
+          : "早点出发，留足路上的时间",
+        duration: travelDuration,
+        transport: travelDuration,
+        cost: travelCost,
+        source: "transport",
+      });
+    }
+
+    // Day 1 酒店入住（仅在用户确认过酒店信息时生成）
+    if (d === 1 && tags.hotelStatus) {
+      items.push({
+        time: hasLeg ? padHour(arrivalHour) : "14:00",
+        activity: "酒店办理入住",
+        note: "先把行李放下，稍作休整再出门",
+        source: "rest",
+      });
+    }
+
+    // 留白占位（P4 不渲染 placeholder，空槽本身就是放置区；这里只提供结构）
+    if (d === 1) {
+      if (hasLeg) {
+        const h1 = padHour(Math.max(arrivalHour + 1, 15));
+        items.push(placeholder(h1, "这个时段交给你，塞一个想去的景点或咖啡馆都行"));
+        if (h1 !== "19:00") {
+          items.push(placeholder("19:00", "晚上留给你，找一顿好吃的或看看夜景"));
+        }
+      } else {
+        items.push(placeholder("10:00", "这个时段交给你，塞一个想去的景点或咖啡馆都行"));
+        items.push(placeholder("15:00", "下午的时光由你安排"));
+        items.push(placeholder("19:00", "晚上留给你，找一顿好吃的或看看夜景"));
+      }
+    } else if (d < dayCount) {
+      items.push(placeholder("09:00", "上午交给一个你最想去的地方"));
+      items.push(placeholder("14:00", "下午的时光由你安排"));
+      items.push(placeholder("19:00", "晚上留给你，找一顿好吃的或看看夜景"));
+    } else {
+      // 最后一天：上午留白（返程时间够晚才放），然后返程
+      if (retHour >= 11) {
+        items.push(placeholder("09:00", "退房前还可以在附近走走"));
+      }
+    }
+
+    // 最后一天返程交通
+    if (d === dayCount && hasLeg) {
+      items.push({
+        time: retTimeStr,
+        activity: backLabel,
+        note: tags.returnTime === "一早返程" ? "早起返程，到家还能休息一下" : "午饭后返程，避开晚高峰",
+        duration: travelDuration,
+        transport: travelDuration,
+        cost: travelCost,
+        source: "transport",
+      });
+    }
+
+    days.push({ dayIndex: d, items });
+  }
+
+  return {
+    planningThought: tags.hotelStatus
+      ? "画布模式：已为你锁定往返交通与酒店入住，其余时段留白，由你亲手填充。"
+      : "画布模式：已为你搭好行程骨架，其余时段留白，由你亲手填充。",
+    title: `${destination}${dayCount}日自定义画布`,
+    vibeTheme: inferVibeTheme(destination),
+    overview: "交通和住宿的骨架已经搭好，剩下的空白时段由你亲手填充。",
+    travelTips: [
+      "空白时段不是遗漏，是留给你自由安排的空间",
+      "把想去的地方从待安排卡片放进每天的空档即可，安排会自动保存",
+      "行程可以随时回来继续调整",
+    ],
+    omittedSpots: [],
+    days,
+  };
+}
+
+/**
+ * 常规模式（非画布）LLM 生成失败时的兜底行程。
+ * 原 POST 内联 catch 块原样迁移，未改内容。
+ */
+function buildFallbackGenerated(
+  destination: string,
+  tags: ExtractedTags
+): TripGenerateResponse {
+  // 创建一个更具体的兜底行程
+  const theme = inferVibeTheme(destination);
+  const pref =
+    tags.preferences.length > 0 ? tags.preferences[0] : "观光";
+
+  // 推断天数
+  let dayCount = tags.days ?? 2;
+  const dates = tags.dates?.toLowerCase() ?? "";
+  if (/三天|3天|三日|3日/.test(dates)) dayCount = 3;
+  else if (/四天|4天|四日|4日/.test(dates)) dayCount = 4;
+  else if (/五天|5天|五日|5日/.test(dates)) dayCount = 5;
+
+  // 根据目的地生成更具体的兜底
+  let isPutuo = /普陀山/.test(destination);
+  let isXiamen = /厦门/.test(destination);
+  let isXian = /西安/.test(destination);
+
+  // 构建兜底天数
+  const fallbackDays = [];
+  for (let d = 1; d <= dayCount; d++) {
+    if (d === 1) {
+      fallbackDays.push({
+        dayIndex: 1,
+        items: [
+          {
+            time: "09:00",
+            activity: isPutuo ? "普济寺参拜" : isXiamen ? "鼓浪屿游览" : isXian ? "兵马俑参观" : `${destination}核心景区游览`,
+            note: "上午游客较少，适合慢慢游览",
+            duration: "2 小时",
+            transport: "步行/打车",
+            cost: isPutuo ? "门票 35 元/人" : "视景点而定",
+            source: "recommended",
+          },
+          {
+            time: "12:00",
+            activity: isPutuo ? "普济寺素斋午餐" : isXiamen ? "沙茶面特色午餐" : isXian ? "肉夹馍凉皮午餐" : "当地特色午餐",
+            note: "尝尝本地风味",
+            duration: "1.5 小时",
+            transport: "步行 10 分钟",
+            cost: isPutuo ? "约 50 元/人" : "约 60 元/人",
+            source: "food",
+            recommendedDish: isPutuo ? "素面、素鸭" : isXiamen ? "沙茶面、海蛎煎" : isXian ? "肉夹馍、凉皮" : "当地特色菜",
+          },
+          {
+            time: "14:30",
+            activity: isPutuo ? "法雨寺游览" : isXiamen ? "曾厝垵漫步" : isXian ? "华清宫游览" : "继续深度游览",
+            note: "下午可以去一些有特色的地方",
+            duration: "2 小时",
+            transport: "步行",
+            cost: isPutuo ? "门票 30 元/人" : "免费或门票",
+            source: "recommended",
+          },
+          {
+            time: "17:00",
+            activity: isPutuo ? "百步沙看日落" : isXiamen ? "环岛路看海" : isXian ? "大雁塔赏景" : "看日落/赏景",
+            note: "傍晚光线柔和，适合拍照",
+            duration: "1 小时",
+            transport: "步行",
+            cost: "免费",
+            source: "recommended",
+          },
+          {
+            time: "19:00",
+            activity: isPutuo ? "朱家尖海鲜排档晚餐" : isXiamen ? "八市海鲜加工晚餐" : isXian ? "回民街晚餐" : "晚餐",
+            note: "用一顿好吃的结束第一天",
+            duration: "1.5 小时",
+            transport: "打车 15 分钟",
+            cost: isPutuo ? "约 150 元/人" : "约 80 元/人",
+            source: "food",
+            recommendedDish: isPutuo ? "清蒸梭子蟹、椒盐皮皮虾" : isXiamen ? "海鲜加工" : isXian ? "羊肉泡馍" : "招牌菜",
+          },
+          {
+            time: "21:00",
+            activity: "回酒店休息",
+            note: "养足精神迎接第二天",
+            source: "rest",
+          },
+        ],
+      });
+    } else if (d < dayCount) {
+      fallbackDays.push({
+        dayIndex: d,
+        items: [
+          {
+            time: "09:00",
+            activity: isPutuo ? "南海观音参拜" : isXiamen ? "南普陀寺祈福" : isXian ? "明城墙漫步" : "另一景区游览",
+            note: "今天去一些昨天没去到的地方",
+            duration: "2 小时",
+            transport: "步行/打车",
+            cost: "视景点而定",
+            source: "recommended",
+          },
+          {
+            time: "11:30",
+            activity: "当地小吃",
+            note: "边走边吃，感受地道风味",
+            duration: "1 小时",
+            transport: "步行",
+            cost: "约 30 元/人",
+            source: "food",
+            recommendedDish: isPutuo ? "观音饼" : isXiamen ? "土笋冻" : isXian ? "柿子饼" : "特色小吃",
+          },
+          {
+            time: "14:00",
+            activity: "休闲时光",
+            note: "可以找个地方坐坐，整理照片",
+            duration: "1.5 小时",
+            transport: "步行",
+            cost: "约 40 元/人",
+            source: "recommended",
+          },
+          {
+            time: "16:00",
+            activity: isPutuo ? "西天景区漫步" : isXiamen ? "中山路购物" : isXian ? "回民街逛吃" : "逛特色街区/买伴手礼",
+            note: "带点当地特色回家",
+            duration: "1 小时",
+            transport: "步行",
+            cost: "因人而异",
+            source: "recommended",
+          },
+          {
+            time: "18:00",
+            activity: "告别晚餐",
+            note: "用一顿好吃的结束这一天",
+            duration: "1.5 小时",
+            transport: "步行",
+            cost: "约 80 元/人",
+            source: "food",
+            recommendedDish: "本地特色",
+          },
+          {
+            time: "20:00",
+            activity: "回酒店休息",
+            note: "整理回忆",
+            source: "rest",
+          },
+        ],
+      });
+    } else {
+      // 最后一天
+      fallbackDays.push({
+        dayIndex: d,
+        items: [
+          {
+            time: "09:00",
+            activity: isPutuo ? "紫竹林最后一拜" : isXiamen ? "厦门大学打卡" : isXian ? "最后一个景点打卡" : "最后一个景点打卡",
+            note: "把还没去的地方补一下",
+            duration: "2 小时",
+            transport: "步行/打车",
+            cost: "视景点而定",
+            source: "recommended",
+          },
+          {
+            time: "12:00",
+            activity: "最后的午餐",
+            note: "再吃一顿本地特色，圆满结束旅程，建议中午吃完返程避开高峰",
+            duration: "1.5 小时",
+            transport: "步行",
+            cost: "约 80 元/人",
+            source: "food",
+            recommendedDish: "必吃招牌菜",
+          },
+          {
+            time: "14:00",
+            activity: "准备返程",
+            note: "中午吃完午饭返程，避开下午高速高峰时段",
+            duration: "灵活",
+            transport: "自驾/打车去车站",
+            cost: "视交通方式而定",
+            source: "transport",
+          },
+        ],
+      });
+    }
+  }
+
+  return {
+    title: `${destination} · ${pref}之旅`,
+    vibeTheme: theme,
+    overview: `这是一场围绕「${pref}」展开的${destination}之旅，节奏轻松，适合慢慢走、慢慢看。`,
+    travelTips: [
+      "建议穿舒适的鞋子，每天步行较多",
+      "提前查好天气，带上轻便外套",
+      "热门餐厅建议错峰用餐",
+      "最后一天建议中午吃完午饭返程，避开下午高峰时段"
+    ],
+    days: fallbackDays,
+  };
 }
 
 export async function GET() {
@@ -97,8 +474,10 @@ export async function POST(req: Request) {
         }
       : tags;
 
+    // 🎨 2.0 画布模式：行程由用户亲手排，不需要多人调和，跳过这次 LLM 调用
     let autoHarmony = body.harmony;
     const needsAutoHarmony =
+      !isCustomCanvas &&
       !autoHarmony &&
       (enrichedTags.groupMode ||
         (enrichedTags.peopleCount != null && enrichedTags.peopleCount > 1) ||
@@ -115,225 +494,44 @@ export async function POST(req: Request) {
       }
     }
 
+    // 🆕 自驾用户：先查真实驾车路线（时长+服务区+过路费）。
+    // 注意：这是高德 REST（非 LLM），画布/常规两种模式共用。
+    let drivingRoute: DrivingRoute | null = null;
+    if (
+      tags.departure &&
+      tags.transportation &&
+      (tags.transportation === "自驾" || tags.transportation.includes("自驾"))
+    ) {
+      try {
+        drivingRoute = await getDrivingRoute(tags.departure, destination);
+        if (drivingRoute) {
+          console.log(
+            `[trips] driving route: ${tags.departure}→${destination} ${drivingRoute.durationText}, ${drivingRoute.distanceKm}km, 服务区${drivingRoute.serviceAreas.length}个`
+          );
+        }
+      } catch (e) {
+        console.warn("[trips] driving route query failed, fallback to estimate:", e);
+      }
+    }
+
     let generated: TripGenerateResponse;
-    try {
-      // 🆕 自驾用户：先查真实驾车路线（时长+服务区+过路费）
-      let drivingRoute = null;
-      if (
-        tags.departure &&
-        tags.transportation &&
-        (tags.transportation === "自驾" || tags.transportation.includes("自驾"))
-      ) {
-        try {
-          drivingRoute = await getDrivingRoute(tags.departure, destination);
-          if (drivingRoute) {
-            console.log(
-              `[trips] driving route: ${tags.departure}→${destination} ${drivingRoute.durationText}, ${drivingRoute.distanceKm}km, 服务区${drivingRoute.serviceAreas.length}个`
-            );
-          }
-        } catch (e) {
-          console.warn("[trips] driving route query failed, fallback to estimate:", e);
-        }
+    if (isCustomCanvas) {
+      // 🎨 2.0 自定义画布：纯代码生成确定性骨架（交通+酒店入住+留白占位），
+      // 不调用 tripPrompt / ollamaJson / 任何 LLM —— 秒回、永不超时、绝不编造景点。
+      console.log("[trips] 🎨 自定义画布：代码生成骨架（不调用 LLM）");
+      generated = buildCanvasSkeleton({ destination, tags, drivingRoute });
+      console.log("[trips] canvas skeleton generated, days:", generated.days.length);
+    } else {
+      try {
+        const rawUserText = body.rawUserText?.trim() || undefined;
+        const prompt = tripPrompt(destination, enrichedTags, selectedCards, rawUserText, autoHarmony, drivingRoute, isCustomCanvas);
+        console.log("[trips] calling ollamaJson, prompt length:", prompt.length);
+        generated = await ollamaJson<TripGenerateResponse>(prompt);
+        console.log("[trips] ollamaJson success, days:", generated.days?.length);
+      } catch (e) {
+        console.warn("[trips] ollamaJson failed:", e);
+        generated = buildFallbackGenerated(destination, tags);
       }
-
-      const rawUserText = body.rawUserText?.trim() || undefined;
-      if (isCustomCanvas) {
-        console.log("[trips] 🎨 自定义画布模式: 只生成骨架(交通+酒店+placeholder)");
-      }
-      const prompt = tripPrompt(destination, enrichedTags, selectedCards, rawUserText, autoHarmony, drivingRoute, isCustomCanvas);
-      console.log("[trips] calling ollamaJson, prompt length:", prompt.length);
-      generated = await ollamaJson<TripGenerateResponse>(prompt);
-      console.log("[trips] ollamaJson success, days:", generated.days?.length);
-    } catch (e) {
-      console.warn("[trips] ollamaJson failed:", e);
-      // 创建一个更具体的兜底行程
-      const theme = inferVibeTheme(destination);
-      const pref =
-        tags.preferences.length > 0 ? tags.preferences[0] : "观光";
-
-      // 推断天数
-      let dayCount = tags.days ?? 2;
-      const dates = tags.dates?.toLowerCase() ?? "";
-      if (/三天|3天|三日|3日/.test(dates)) dayCount = 3;
-      else if (/四天|4天|四日|4日/.test(dates)) dayCount = 4;
-      else if (/五天|5天|五日|5日/.test(dates)) dayCount = 5;
-
-      // 根据目的地生成更具体的兜底
-      let isPutuo = /普陀山/.test(destination);
-      let isXiamen = /厦门/.test(destination);
-      let isXian = /西安/.test(destination);
-
-      // 构建兜底天数
-      const fallbackDays = [];
-      for (let d = 1; d <= dayCount; d++) {
-        if (d === 1) {
-          fallbackDays.push({
-            dayIndex: 1,
-            items: [
-              {
-                time: "09:00",
-                activity: isPutuo ? "普济寺参拜" : isXiamen ? "鼓浪屿游览" : isXian ? "兵马俑参观" : `${destination}核心景区游览`,
-                note: "上午游客较少，适合慢慢游览",
-                duration: "2 小时",
-                transport: "步行/打车",
-                cost: isPutuo ? "门票 35 元/人" : "视景点而定",
-                source: "recommended",
-              },
-              {
-                time: "12:00",
-                activity: isPutuo ? "普济寺素斋午餐" : isXiamen ? "沙茶面特色午餐" : isXian ? "肉夹馍凉皮午餐" : "当地特色午餐",
-                note: "尝尝本地风味",
-                duration: "1.5 小时",
-                transport: "步行 10 分钟",
-                cost: isPutuo ? "约 50 元/人" : "约 60 元/人",
-                source: "food",
-                recommendedDish: isPutuo ? "素面、素鸭" : isXiamen ? "沙茶面、海蛎煎" : isXian ? "肉夹馍、凉皮" : "当地特色菜",
-              },
-              {
-                time: "14:30",
-                activity: isPutuo ? "法雨寺游览" : isXiamen ? "曾厝垵漫步" : isXian ? "华清宫游览" : "继续深度游览",
-                note: "下午可以去一些有特色的地方",
-                duration: "2 小时",
-                transport: "步行",
-                cost: isPutuo ? "门票 30 元/人" : "免费或门票",
-                source: "recommended",
-              },
-              {
-                time: "17:00",
-                activity: isPutuo ? "百步沙看日落" : isXiamen ? "环岛路看海" : isXian ? "大雁塔赏景" : "看日落/赏景",
-                note: "傍晚光线柔和，适合拍照",
-                duration: "1 小时",
-                transport: "步行",
-                cost: "免费",
-                source: "recommended",
-              },
-              {
-                time: "19:00",
-                activity: isPutuo ? "朱家尖海鲜排档晚餐" : isXiamen ? "八市海鲜加工晚餐" : isXian ? "回民街晚餐" : "晚餐",
-                note: "用一顿好吃的结束第一天",
-                duration: "1.5 小时",
-                transport: "打车 15 分钟",
-                cost: isPutuo ? "约 150 元/人" : "约 80 元/人",
-                source: "food",
-                recommendedDish: isPutuo ? "清蒸梭子蟹、椒盐皮皮虾" : isXiamen ? "海鲜加工" : isXian ? "羊肉泡馍" : "招牌菜",
-              },
-              {
-                time: "21:00",
-                activity: "回酒店休息",
-                note: "养足精神迎接第二天",
-                source: "rest",
-              },
-            ],
-          });
-        } else if (d < dayCount) {
-          fallbackDays.push({
-            dayIndex: d,
-            items: [
-              {
-                time: "09:00",
-                activity: isPutuo ? "南海观音参拜" : isXiamen ? "南普陀寺祈福" : isXian ? "明城墙漫步" : "另一景区游览",
-                note: "今天去一些昨天没去到的地方",
-                duration: "2 小时",
-                transport: "步行/打车",
-                cost: "视景点而定",
-                source: "recommended",
-              },
-              {
-                time: "11:30",
-                activity: "当地小吃",
-                note: "边走边吃，感受地道风味",
-                duration: "1 小时",
-                transport: "步行",
-                cost: "约 30 元/人",
-                source: "food",
-                recommendedDish: isPutuo ? "观音饼" : isXiamen ? "土笋冻" : isXian ? "柿子饼" : "特色小吃",
-              },
-              {
-                time: "14:00",
-                activity: "休闲时光",
-                note: "可以找个地方坐坐，整理照片",
-                duration: "1.5 小时",
-                transport: "步行",
-                cost: "约 40 元/人",
-                source: "recommended",
-              },
-              {
-                time: "16:00",
-                activity: isPutuo ? "西天景区漫步" : isXiamen ? "中山路购物" : isXian ? "回民街逛吃" : "逛特色街区/买伴手礼",
-                note: "带点当地特色回家",
-                duration: "1 小时",
-                transport: "步行",
-                cost: "因人而异",
-                source: "recommended",
-              },
-              {
-                time: "18:00",
-                activity: "告别晚餐",
-                note: "用一顿好吃的结束这一天",
-                duration: "1.5 小时",
-                transport: "步行",
-                cost: "约 80 元/人",
-                source: "food",
-                recommendedDish: "本地特色",
-              },
-              {
-                time: "20:00",
-                activity: "回酒店休息",
-                note: "整理回忆",
-                source: "rest",
-              },
-            ],
-          });
-        } else {
-          // 最后一天
-          fallbackDays.push({
-            dayIndex: d,
-            items: [
-              {
-                time: "09:00",
-                activity: isPutuo ? "紫竹林最后一拜" : isXiamen ? "厦门大学打卡" : isXian ? "最后一个景点打卡" : "最后一个景点打卡",
-                note: "把还没去的地方补一下",
-                duration: "2 小时",
-                transport: "步行/打车",
-                cost: "视景点而定",
-                source: "recommended",
-              },
-              {
-                time: "12:00",
-                activity: "最后的午餐",
-                note: "再吃一顿本地特色，圆满结束旅程，建议中午吃完返程避开高峰",
-                duration: "1.5 小时",
-                transport: "步行",
-                cost: "约 80 元/人",
-                source: "food",
-                recommendedDish: "必吃招牌菜",
-              },
-              {
-                time: "14:00",
-                activity: "准备返程",
-                note: "中午吃完午饭返程，避开下午高速高峰时段",
-                duration: "灵活",
-                transport: "自驾/打车去车站",
-                cost: "视交通方式而定",
-                source: "transport",
-              },
-            ],
-          });
-        }
-      }
-
-      generated = {
-        title: `${destination} · ${pref}之旅`,
-        vibeTheme: theme,
-        overview: `这是一场围绕「${pref}」展开的${destination}之旅，节奏轻松，适合慢慢走、慢慢看。`,
-        travelTips: [
-          "建议穿舒适的鞋子，每天步行较多",
-          "提前查好天气，带上轻便外套",
-          "热门餐厅建议错峰用餐",
-          "最后一天建议中午吃完午饭返程，避开下午高峰时段"
-        ],
-        days: fallbackDays,
-      };
     }
 
     // ===== 后处理：兜底修正 =====

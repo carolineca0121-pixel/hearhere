@@ -49,6 +49,21 @@ export function gcj02ToWgs84(lng: number, lat: number): { lng: number; lat: numb
   return { lng: lng - dLngFinal, lat: lat - dLatFinal };
 }
 
+/** WGS84 → GCJ-02 (高德/国测局) —— gcj02ToWgs84 的标准逆变换（同一组 transform，差值取加）。
+ *  项目统一坐标规范（E1b 起）：【入库坐标一律 GCJ-02】——即高德地图原生坐标系，
+ *  所有地图消费方（AmapView）零转换直接使用；语音卡本就是 GCJ-02，推荐卡在 discover 入库时转换。 */
+export function wgs84ToGcj02(lng: number, lat: number): { lng: number; lat: number } {
+  const dLat = transformLat(lng - 105.0, lat - 35.0);
+  const dLng = transformLng(lng - 105.0, lat - 35.0);
+  const radLat = (lat / 180.0) * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  const dLatFinal = (dLat * 180.0) / (((A * (1 - EE)) / (magic * sqrtMagic)) * Math.PI);
+  const dLngFinal = (dLng * 180.0) / ((A / sqrtMagic) * Math.cos(radLat) * Math.PI);
+  return { lng: lng + dLngFinal, lat: lat + dLatFinal };
+}
+
 // ── 类别常量 ──────────────────────────────────────────
 
 export const ATTRACTION_TYPES = ["110000", "110100", "110200", "140000"];
