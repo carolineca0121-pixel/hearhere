@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Users, Clock, Car, X, AlertTriangle, Check, Mic, Square } from "lucide-react";
+import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Users, Clock, Car, X, Check, Mic, Square } from "lucide-react";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
@@ -69,7 +69,6 @@ export default function DiscoverPage() {
   const [mealType, setMealType] = useState("");
   const [cuisine, setCuisine] = useState("");
   // 选择数量校验
-  const [showInsufficientWarning, setShowInsufficientWarning] = useState(false);
   const [canvasCreating, setCanvasCreating] = useState(false);
   const [canvasError, setCanvasError] = useState<string | null>(null);
   const [recommendError, setRecommendError] = useState<string | null>(null);
@@ -89,7 +88,7 @@ export default function DiscoverPage() {
           rawUserText: transcript,
           // 2.0：已选卡片随身带入行程（卡片池 + 打卡清单的数据源），画布骨架不受影响
           // location 必须保留（P4 地图标注与坐标注入的数据源）
-          selectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason, location: c.location })),
+          selectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason, location: c.location, category: c.category })),
           selectedFoods: [],
           isCustomCanvas: true,
         }),
@@ -318,8 +317,6 @@ export default function DiscoverPage() {
 
   // ── 选择数量校验 ──
   const days = tags?.days || 3;
-  const minRecommended = days * 2; // 每天至少 2 个点
-  const isInsufficient = selectedContent.length < minRecommended;
 
   const handleGoBuilder = () => {
     // 2.0：不再去 builder 页，直接生成骨架行程（交通+酒店预留），进攻略卡页拖拽排程
@@ -628,58 +625,6 @@ export default function DiscoverPage() {
           </button>
         </motion.div>
       )}
-
-      {/* ── 选择不足警告弹窗 ── */}
-      <AnimatePresence>
-        {showInsufficientWarning && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/40 backdrop-blur-sm"
-            onClick={() => setShowInsufficientWarning(false)}
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.9, y: 20 }}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-sm"
-            >
-              <GlassCard className="p-5">
-                <div className="flex items-start gap-3 mb-4">
-                  <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
-                    <AlertTriangle className="w-5 h-5 text-amber-600" />
-                  </div>
-                  <div>
-                    <h3 className="text-base font-semibold text-charcoal mb-1">
-                      地点可能不够哦
-                    </h3>
-                    <p className="text-sm text-charcoal/70 leading-relaxed">
-                      {days} 天行程建议至少选 {minRecommended} 个地点，你现在只选了 {selectedContent.length} 个。
-                      继续生成的话，行程可能会比较空。
-                    </p>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setShowInsufficientWarning(false)}
-                    className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium"
-                  >
-                    再去选一些
-                  </button>
-                  <button
-                    onClick={() => { setShowInsufficientWarning(false); handleCustomCanvas(); }}
-                    className="px-4 py-2.5 rounded-xl border border-charcoal/15 text-sm text-muted hover:text-charcoal transition-colors"
-                  >
-                    直接生成
-                  </button>
-                </div>
-              </GlassCard>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* ── 🎨 画布创建全局遮罩：创建期间阻塞一切交互，消灭「延迟跳转的劫持感」 ── */}
       {canvasCreating && (

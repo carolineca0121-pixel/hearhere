@@ -12,6 +12,9 @@ import {
   type PlanCardRef,
 } from "@/lib/plan-normalizer";
 import { occupiedIntervalsFor } from "@/lib/duration";
+import { resolvePlanningRules, weatherWarnings, alignWeatherToTripDays } from "@/lib/planning-rules";
+import { geoFactsFor, farPairWarnings } from "@/lib/geo";
+import { getWeather } from "@/lib/amap";
 import type { DayPlanItem } from "@/lib/types";
 
 export const maxDuration = 60;
@@ -108,6 +111,7 @@ export async function POST(
         title: String(c.title ?? ""),
         description: typeof c.description === "string" ? c.description : undefined,
         reason: typeof c.reason === "string" ? c.reason : undefined,
+        category: typeof c.category === "string" ? c.category : undefined,
         location:
           c.location && typeof c.location === "object"
             ? (c.location as PlanCardRef["location"])
@@ -123,11 +127,9 @@ export async function POST(
       const items = parseItems(d.content);
       return occupiedIntervalsFor(items, d.dayIndex, true);
     });
-    // 节奏密度：「不要太累/轻松/慢节奏/陪父母/老人」→ 每天最多 3 个主要安排（否则默认 4）
-    const prefArr = Array.isArray(tags.preferences) ? (tags.preferences as unknown[]) : [];
-    const consArr = Array.isArray(tags.constraints) ? (tags.constraints as unknown[]) : [];
-    const paceText = [...prefArr, ...consArr].join(" ");
-    const maxPerDay = /不要太累|轻松|慢|父母|老人|长辈/.test(paceText) ? 3 : undefined;
+    // 节奏与偏好 → 规则层（E4-1：可扩展规则，硬约束+prompt 指导+触发记录）
+    const rulesCtx = resolvePlanningRules(tags);
+    const maxPerDay = rulesCtx.maxPerDay;
 
     // 无已选卡片：不调 LLM，直接返回空结果（卡片全在池中由用户手动安排）
     if (cards.length === 0) {
@@ -148,6 +150,23 @@ export async function POST(
     const goT = day1Items.find((i) => i.source === "transport");
     const backT = [...lastItems].reverse().find((i) => i.source === "transport");
 
+    // E4-4 天气事实（Gate 修正：只有「明确旅行日期且落在预报范围内」才注入 day-specific 事实；
+    // 无日期/超范围/API失败 → 不注入、不报错、规划照常。日级粒度，禁止伪精确扩写。）
+    let weatherFacts: string[] = [];
+    const rainyDays = new Set<number>();
+    try {
+      const w = await getWeather(trip.destination);
+      const aligned = alignWeatherToTripDays(
+        (w.forecasts ?? []) as { date: string; dayWeather: string; dayTemp: number; nightTemp: number }[],
+        dayCount,
+        typeof tags.dates === "string" ? tags.dates : undefined
+      );
+      weatherFacts = aligned.facts;
+      aligned.rainyDays.forEach((d) => rainyDays.add(d));
+    } catch (e) {
+      console.warn("[plan] weather unavailable, continue without:", e instanceof Error ? e.message : e);
+    }
+
     const prompt = planPrompt({
       destination: trip.destination,
       tags,
@@ -155,6 +174,9 @@ export async function POST(
       cards: cards.map((c) => ({ ...c, cardId: c.id ?? null })),
       dayCount,
       anchors,
+      ruleHints: rulesCtx.promptHints,
+      geoFacts: geoFactsFor(cards.map((c) => ({ title: c.title, location: c.location }))),
+      weatherFacts,
       skeletonFacts: {
         goLabel: goT?.activity,
         goTime: goT?.time,
@@ -173,6 +195,11 @@ export async function POST(
       repair: true,
     });
     const result = normalizeAiPlan({ raw, cards, dayCount, anchors, occupiedIntervals, maxPerDay });
+    if (rulesCtx.notes.length > 0) result.ruleNotes = rulesCtx.notes;
+    // E4-3 地理 soft rule：同日被排的两卡直线距离 >25km → warning（不拒收；真实交通时间模型属 E5）
+    result.warnings.push(...farPairWarnings(result.placementsByDay));
+    // E4-4 天气 soft rule：雨天白天的户外型景点 → warning（不自动调整；用户安排绝不动）
+    result.warnings.push(...weatherWarnings(result.placementsByDay, cards, rainyDays));
     console.log(
       `[plan] trip=${tripId} LLM+normalize ${Date.now() - t0}ms → placed=${Object.values(result.placementsByDay).flat().length} unplaced=${result.unplaced.length} rejected=${result.rejected.length}`
     );

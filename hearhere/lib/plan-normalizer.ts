@@ -44,6 +44,25 @@ export interface PlanCardRef {
   description?: string;
   reason?: string;
   location?: { lng?: number; lat?: number; address?: string };
+  /** E4-2：卡片分类（attraction/food/souvenir），饭点 soft rule 的数据基础 */
+  category?: string;
+}
+
+/** E4-2 饭点时间窗（分钟制）：早餐/午餐/下午茶/晚餐。餐厅落在窗外 → warning（soft rule，不拒收）
+ * ⚠️ MVP 能力边界：当前只识别「category=food → 尽量落在进食窗口」，
+ * 不区分早餐店/正餐/夜宵等细分餐饮类型（breakfast/brunch/lunch/dinner 分类属后续迭代）。 */
+export const MEAL_WINDOWS: { name: string; startMin: number; endMin: number }[] = [
+  { name: "早餐", startMin: 7 * 60, endMin: 10 * 60 },
+  { name: "午餐", startMin: 11 * 60, endMin: 14 * 60 },
+  { name: "下午茶", startMin: 14 * 60, endMin: 17 * 60 },
+  { name: "晚餐", startMin: 17 * 60, endMin: 20 * 60 + 30 },
+];
+
+/** 判断时间是否落在任一饭点窗口 */
+export function inMealWindow(time: string): boolean {
+  const m = timeToMinutes(time);
+  if (m === null) return false;
+  return MEAL_WINDOWS.some((w) => m >= w.startMin && m < w.endMin);
 }
 
 /** 时间锚点（由代码从 tags/驾线路程预算好）：Day1 最早可排小时、末日最晚可排小时 */
@@ -72,6 +91,8 @@ export interface NormalizeResult {
   rejected: { raw: string; reason: string }[];
   /** 代码计算的提示（如「Day N 排满」），不依赖 LLM 自评 */
   warnings: string[];
+  /** E4-1：命中的规划规则记录（如「节奏：不要太累 → 每天 ≤3 项」），供 UI 展示「系统为什么这样安排」 */
+  ruleNotes?: string[];
 }
 
 /** 每天 selected_card 上限（硬限制，不靠 prompt 自觉） */
@@ -194,8 +215,24 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
 
   const usedKeys = new Set<string>(); // cardId（或 legacy title:） 唯一性
   const perDayCount: Record<number, number> = {};
+  // E4-6：每天已接受 placement 的占用时间（用于活动间 duration 互斥）
+  const acceptedSpans = new Map<number, { startMin: number; endMin: number; label: string }[]>();
 
-  placements.forEach((p: unknown, idx: number) => {
+  // 确定性处理顺序（E4-6 Gate）：按 dayIndex → time → cardId/cardTitle 稳定排序后再校验。
+  // 不改变 AI 决定的 day/time，只让校验顺序与 LLM 数组顺序无关（同一输入恒定同一结果）。
+  const sortedPlacements = [...placements].sort((a: unknown, b: unknown) => {
+    const key = (x: unknown): string => {
+      if (!x || typeof x !== "object" || Array.isArray(x)) return "999|99:99|~";
+      const p = x as Record<string, unknown>;
+      const d = normalizeDayIndex(p.dayIndex, dayCount) ?? 999;
+      const t = normalizeTime(p.time) ?? "99:99";
+      const id = typeof p.cardId === "string" ? p.cardId : typeof p.cardTitle === "string" ? `t:${p.cardTitle}` : "~";
+      return `${String(d).padStart(3, "0")}|${t}|${id}`;
+    };
+    return key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0; // Array.sort 稳定，同键保持原顺序
+  });
+
+  sortedPlacements.forEach((p: unknown, idx: number) => {
     const rawShort = short(p);
     const reject = (reason: string) => { result.rejected.push({ raw: rawShort, reason }); };
 
@@ -216,22 +253,27 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     const time = normalizeTime(pp.time);
     if (!time) { reject("time 非法（需 HH:MM）"); return; }
 
-    // 锚点约束：Day1 不能早于到达、末日不能晚于返程（代码执行，不靠 AI 自觉）
+    // 锚点约束：Day1 不能早于到达、末日「开始+duration」不能超过返程（代码执行，不靠 AI 自觉）
     const hour = Number(time.slice(0, 2));
+    const startMin = timeToMinutes(time);
+    const spanMin = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
     if (anchorCheckEnabled) {
       if (day === 1 && hour < anchors.day1EarliestHour) {
         reject(`早于 Day1 到达时间（${anchors.day1EarliestHour}:00 前不可排）`); return;
       }
-      if (day === dayCount && hour > anchors.lastDayLatestHour) {
-        reject(`晚于末日返程时间（${anchors.lastDayLatestHour}:00 后不可排）`); return;
+      // 末日结束边界（E4-6 Gate）：start+duration ≤ 返程时刻（贴边允许）
+      if (day === dayCount && startMin !== null && startMin + spanMin > anchors.lastDayLatestHour * 60) {
+        reject(`结束于返程之后（${time} 起 ${spanMin} 分钟会超过 ${anchors.lastDayLatestHour}:00 返程）`); return;
       }
+    }
+    // 跨午夜（E4-6 Gate）：MVP 不建模跨天活动，明确拒收而非静默溢出到次日
+    if (startMin !== null && startMin + spanMin > 24 * 60) {
+      reject(`活动跨午夜（${time} 起 ${spanMin} 分钟超出当天 24:00），当前版本不支持`); return;
     }
 
     // 占用区间约束：与交通等已占用时间冲突 → 拒收（duration 是真实规划约束，不只是 UI）
-    const startMin = timeToMinutes(time);
     const dayIntervals = occupiedByDay.get(day);
     if (startMin !== null && dayIntervals?.length) {
-      const spanMin = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
       const hit = dayIntervals.find((iv) => intervalOverlaps(startMin, spanMin, iv));
       if (hit) {
         reject(`与「${hit.label}」时间冲突（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)} 已被占用）`);
@@ -276,7 +318,30 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     const note = sanitizeNote(pp.note);
     if (note) item.note = note;
 
+    // E4-6 活动互斥：与当天已接受 placement 的 duration 区间重叠 → 拒收（贴边允许）
+    if (startMin !== null) {
+      const span = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
+      const accepted = acceptedSpans.get(day) ?? [];
+      const hit = accepted.find((s) => intervalOverlaps(startMin, span, { dayIndex: day, startMin: s.startMin, endMin: s.endMin, label: s.label }));
+      if (hit) {
+        reject(`与已安排的「${hit.label}」（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)}）时间重叠`);
+        return;
+      }
+    }
+
+    // E4-2 饭点 soft rule：美食卡落在饭点窗外 → warning（不拒收，用户选择优先）
+    if (card.category === "food" && !inMealWindow(time)) {
+      result.warnings.push(`「${card.title}」安排在 ${time}，不在常规用餐时段（早7-10/午11-14/下午茶14-17/晚17-20:30）`);
+    }
+
     (result.placementsByDay[day] ??= []).push(item);
+    // E4-6：记录已接受项的占用区间（供后续 placement 互斥检查）
+    if (startMin !== null) {
+      const span = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
+      const list = acceptedSpans.get(day) ?? [];
+      list.push({ startMin, endMin: startMin + span, label: card.title });
+      acceptedSpans.set(day, list);
+    }
   });
 
   // 天内按时间排序

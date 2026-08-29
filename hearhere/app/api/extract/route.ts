@@ -77,6 +77,58 @@ function inferRuleTags(text: string): Partial<ExtractedTags> {
   result.constraints = constraints;
   result.groupMode = Boolean(result.peopleCount && result.peopleCount > 1) || /爸妈|父母|朋友|闺蜜|我们/.test(text);
 
+  // ── 出发/返程时间（E4-0：自然语言时间进入 tags，不再静默丢弃；规则层提取，LLM 不涉及）──
+  // 中文数字小时：一点~十二点（含「两」）
+  const zhHour = (s: string): number | null => {
+    const map: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+    if (map[s] != null) return map[s];
+    if (s === "十一") return 11;
+    if (s === "十二") return 12;
+    return null;
+  };
+  const clockToHHMM = (period: string | undefined, hh: string, mmRaw?: string): string | null => {
+    let h = /^\d{1,2}$/.test(hh) ? parseInt(hh, 10) : (zhHour(hh) ?? NaN);
+    if (Number.isNaN(h) || h > 24) return null;
+    let min = 0;
+    const mm = mmRaw?.replace(/\s*分/, "");
+    if (mm === "半") min = 30;
+    else if (mm) { min = parseInt(mm, 10); if (Number.isNaN(min) || min > 59) return null; }
+    if (period && /下午|傍晚|晚上/.test(period) && h < 12) h += 12;
+    if (period && /中午/.test(period) && h >= 1 && h <= 2) h += 12; // 中午1点=13:00
+    if (h > 23) return null;
+    return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+  };
+  // 出发：精确「（下午）3点（半）出发/走」优先（支持中文数字：两点/十二点）
+  const depClock = text.match(/(早上|上午|早晨|中午|下午|傍晚|晚上)?\s*(\d{1,2}|[一二两三四五六七八九]|十[一二]?)\s*[点：:]\s*(半|\d{1,2}\s*分?)?\s*(?:左右)?\s*(?:出发|走)/);
+  if (depClock) {
+    const v = clockToHHMM(depClock[1], depClock[2], depClock[3]);
+    if (v) {
+      result.departureTimeVal = v;
+      const h = parseInt(v.slice(0, 2), 10);
+      result.departureTime = h < 11 ? "早上出发" : h < 14 ? "中午出发" : h < 17 ? "下午出发" : "晚上出发";
+    }
+  }
+  // 出发：模糊标签兜底（「一早」必须紧跟出发/走，避免「一早返程」误伤）
+  if (!result.departureTime) {
+    if (/(?:一早|一大早)\s*(?:出发|走)/.test(text) || /早点出发/.test(text) || /(早上|上午|早晨)\s*(?:出发|走)/.test(text)) result.departureTime = "早上出发";
+    else if (/(午饭后|中午|午后)\s*(?:出发|走)/.test(text)) result.departureTime = "中午出发";
+    else if (/下午\s*(?:出发|走)/.test(text)) result.departureTime = "下午出发";
+    else if (/(傍晚|晚上|晚饭后)\s*(?:出发|走)/.test(text)) result.departureTime = "晚上出发";
+  }
+  // 返程：精确「下午3点返程/回家」（支持中文数字）
+  const retClock = text.match(/(早上|上午|中午|下午|傍晚|晚上)?\s*(\d{1,2}|[一二两三四五六七八九]|十[一二]?)\s*[点：:]\s*(半|\d{1,2}\s*分?)?\s*(?:左右)?\s*(?:返程|回去|回家|回来)/);
+  if (retClock) {
+    const v = clockToHHMM(retClock[1], retClock[2], retClock[3]);
+    if (v) {
+      result.returnTimeVal = v;
+      result.returnTime = parseInt(v.slice(0, 2), 10) < 11 ? "一早返程" : "午饭后返程";
+    }
+  }
+  if (!result.returnTime) {
+    if (/一早\s*(?:返程|回去|回家)/.test(text)) result.returnTime = "一早返程";
+    else if (/(午饭后|下午)\s*(?:返程|回去|回家|回来)/.test(text)) result.returnTime = "午饭后返程";
+  }
+
   return result;
 }
 
@@ -126,6 +178,11 @@ export async function POST(req: Request) {
         ...(ruleTags.constraints ?? []),
         ...(llmTags.constraints ?? []),
       ], 8),
+      // E4-0：出发/返程时间仅由规则层提取（LLM 不提供；P2 可继续手动覆盖）
+      departureTime: ruleTags.departureTime ?? undefined,
+      departureTimeVal: ruleTags.departureTimeVal ?? undefined,
+      returnTime: ruleTags.returnTime ?? undefined,
+      returnTimeVal: ruleTags.returnTimeVal ?? undefined,
       conflicts: uniqueShortTags(llmTags.conflicts ?? [], 10),
       groupMode: Boolean(
         llmTags.groupMode || ruleTags.groupMode ||

@@ -742,11 +742,17 @@ export interface PlanPromptArgs {
   tags: Partial<ExtractedTags>;
   rawUserText?: string;
   /** 用户已选卡片白名单（含真实 cardId 与坐标；无 id 的 legacy 卡 cardId 为 null） */
-  cards: { cardId: string | null; title: string; description?: string; reason?: string; location?: { lng?: number; lat?: number; address?: string } | null }[];
+  cards: { cardId: string | null; title: string; description?: string; reason?: string; category?: string; location?: { lng?: number; lat?: number; address?: string } | null }[];
   dayCount: number;
   anchors: { day1EarliestHour: number; lastDayLatestHour: number };
   /** 骨架确定性事实（代码生成，供 prompt  prose 使用） */
   skeletonFacts: { goLabel?: string; goTime?: string; backLabel?: string; backTime?: string };
+  /** E4-1 规则层产出的行为指导（preference → planning rule），追加到任务区 */
+  ruleHints?: string[];
+  /** E4-3 地理事实（白名单两两直线距离，如「西湖↔灵隐寺≈4.2km」） */
+  geoFacts?: string[];
+  /** E4-4 天气事实（如「Day2（08-29）白天大雨」）；获取失败时缺省（graceful degradation） */
+  weatherFacts?: string[];
 }
 
 export function planPrompt(args: PlanPromptArgs): string {
@@ -759,6 +765,7 @@ export function planPrompt(args: PlanPromptArgs): string {
       title: c.title,
       description: c.description ?? "",
       reason: c.reason ?? "",
+      category: c.category ?? "attraction",
       location: c.location ?? null,
     })),
     null,
@@ -785,8 +792,9 @@ ${cardsJson}
 
 # 你的任务（只做规划判断）
 对每张卡判断：安排到第几天、几点开始、大概停留多久、为什么；不适合本次行程的放入 unplaced 并给一句理由。
-- 节奏：${(tags.preferences ?? []).some((p) => /父母|老人|家庭/.test(p)) ? "陪父母出行，" : ""}每天 2-3 个主要安排为宜，上午一个下午一个，留出吃饭和休息间隙
-- 组合：地理位置相近的尽量安排在同一天相邻时段
+- 节奏：${(tags.preferences ?? []).some((p) => /父母|老人|家庭/.test(p)) ? "陪父母出行，" : ""}每天 2-3 个主要安排为宜，上午一个下午一个，留出吃饭和休息间隙${(args.ruleHints ?? []).length > 0 ? `\n- 规则约束：${(args.ruleHints ?? []).join("；")}` : ""}
+- 组合：地理位置相近的尽量安排在同一天相邻时段${(args.geoFacts ?? []).length > 0 ? `（两两直线距离：${(args.geoFacts ?? []).join("；")}）` : ""}
+- 饭点：category 为 food 的卡是餐饮，尽量安排在饭点时段（早餐 7-10 点 / 午餐 11-14 点 / 下午茶 14-17 点 / 晚餐 17-20:30）；souvenir 伴手礼适合下午或傍晚${(args.weatherFacts ?? []).length > 0 ? `\n- 天气：${(args.weatherFacts ?? []).join("；")}。白天有雨的日子优先安排室内/缩短户外停留，不得不安排户外时在 note 里提醒带雨具` : ""}
 - 同名不同 cardId 的卡是两个独立对象，可以分别安排
 
 # 输出格式（严格 JSON，只输出 JSON 本身）

@@ -1005,6 +1005,12 @@ export default function TripPage() {
                                         <span className="font-medium">{it.activity}</span>
                                         {it.duration && <span className="text-[10px] opacity-60">{it.duration}</span>}
                                         {it.cost && <span className="text-[10px] opacity-60">{it.cost}</span>}
+                                        {/* E4-5 可解释性：AI 规划理由真实可见（truncate 保护布局，title 悬浮看全文） */}
+                                        {it.note && (
+                                          <span className="text-[10px] opacity-70 max-w-[9rem] truncate" title={it.note}>
+                                            · {it.note}
+                                          </span>
+                                        )}
                                         {!fixed && (
                                           <button
                                             onClick={(e) => { e.stopPropagation(); removePlacedItem(day.dayIndex, it); }}
