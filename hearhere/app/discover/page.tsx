@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Users, Clock, Car, X, Check, Mic, Square } from "lucide-react";
+import { ArrowRight, Sparkles, MapPin, Utensils, Gift, Users, Clock, Car, Check, Mic, Square } from "lucide-react";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import { PoiCard, type PoiCardData } from "@/components/discover/poi-card";
 import { GlassCard } from "@/components/layout/glass-card";
@@ -25,29 +25,6 @@ const CAT_DESC: Record<DiscoverCategory, string> = {
   souvenir: "带点当地特色回家",
 };
 
-// ── 美食筛选 Chip ──
-
-const MEAL_CHIPS = [
-  { key: "", label: "全部时段" },
-  { key: "breakfast", label: "☀️ 早餐" },
-  { key: "lunch", label: "🍱 午餐" },
-  { key: "afternoon", label: "☕ 下午茶" },
-  { key: "dinner", label: "🌙 晚餐" },
-  { key: "latenight", label: "🦉 夜宵" },
-];
-
-const CUISINE_CHIPS = [
-  { key: "", label: "全部菜系" },
-  { key: "local", label: "本地特色" },
-  { key: "chuan", label: "川菜·麻辣" },
-  { key: "yue", label: "粤菜·点心" },
-  { key: "hotpot", label: "火锅·串串" },
-  { key: "seafood", label: "海鲜" },
-  { key: "veg", label: "素食" },
-  { key: "cafe", label: "咖啡·甜品" },
-  { key: "snack", label: "小吃·快餐" },
-];
-
 export default function DiscoverPage() {
   const router = useRouter();
   const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces, reset } = useSessionStore();
@@ -65,9 +42,6 @@ export default function DiscoverPage() {
   // 📷 用户手动移除的截图地名（不强行加回）；新增地名会自动蹦入
   const dismissedShotsRef = useRef<Set<string>>(new Set());
 
-  // 美食筛选
-  const [mealType, setMealType] = useState("");
-  const [cuisine, setCuisine] = useState("");
   // 选择数量校验
   const [canvasCreating, setCanvasCreating] = useState(false);
   const [canvasError, setCanvasError] = useState<string | null>(null);
@@ -121,19 +95,16 @@ export default function DiscoverPage() {
   // ── 加载推荐（带上筛选参数） ──
   // P3 性能修复：同 category+参数的请求在途时去重（mount 时「分类 effect」与「预加载 effect」会重复触发 attraction）
   const inFlightCatsRef = useRef<Set<string>>(new Set());
-  const loadCategory = useCallback(async (category: DiscoverCategory, mt?: string, cui?: string) => {
+  const loadCategory = useCallback(async (category: DiscoverCategory) => {
     if (!destination) return;
-    const flightKey = `${category}|${mt ?? ""}|${cui ?? ""}`;
+    const flightKey = category;
     if (inFlightCatsRef.current.has(flightKey)) return; // 🚀 同一请求在途，直接跳过
     inFlightCatsRef.current.add(flightKey);
     setLoading(true);
     setPendingCats((prev) => new Set(prev).add(category));
     try {
+      // E4.5：美食细分类筛选已删除（UI 层），recommend API 的 mealType/cuisine 入参保留兼容
       const body: any = { destination, tags, category };
-      if (category === "food") {
-        if (mt) body.mealType = mt;
-        if (cui) body.cuisine = cui;
-      }
       if (selectedLocations.length > 0 && category !== "attraction") body.selectedLocations = selectedLocations;
       const res = await fetch("/api/recommend", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const data = await res.json();
@@ -165,14 +136,10 @@ export default function DiscoverPage() {
   useEffect(() => {
     if (!_hydrated || !destination) return;
     if (loadedCatsRef.current.has(activeCategory)) return; // 🚀 缓存命中，0ms
-    if (activeCategory === "food") {
-      loadCategory("food", mealType || undefined, cuisine || undefined);
-    } else {
-      loadCategory(activeCategory);
-    }
+    loadCategory(activeCategory);
   }, [_hydrated, destination, activeCategory]);
 
-  // 🚀 进场即并发预加载全部 4 个分类（各自独立 serverless 调用，互不阻塞）
+  // 🚀 进场即并发预加载全部 3 个分类（各自独立 serverless 调用，互不阻塞）
   useEffect(() => {
     if (!_hydrated || !destination || prefetchFiredRef.current) return;
     prefetchFiredRef.current = true;
@@ -180,13 +147,6 @@ export default function DiscoverPage() {
       (["attraction", "food", "souvenir"] as DiscoverCategory[]).map((c) => loadCategory(c))
     );
   }, [_hydrated, destination, loadCategory]);
-
-  // 筛选变化时重新加载美食
-  useEffect(() => {
-    if (_hydrated && destination && activeCategory === "food") {
-      loadCategory("food", mealType || undefined, cuisine || undefined);
-    }
-  }, [mealType, cuisine]);
 
   useEffect(() => { setSelectedIds(new Set(selectedContent.map((c) => c.id))); }, [selectedContent]);
 
@@ -313,7 +273,6 @@ export default function DiscoverPage() {
 
   const currentCards = (allCards[activeCategory] || []).map((c) => ({ ...c, selected: selectedIds.has(c.id) }));
   const activeColor = CATEGORY_MARKER_COLORS[activeCategory];
-  const isFood = activeCategory === "food";
 
   // ── 选择数量校验 ──
   const days = tags?.days || 3;
@@ -466,55 +425,6 @@ export default function DiscoverPage() {
         </div>
       </div>
 
-      {/* ── 🆕 美食筛选 Chip ── */}
-      {isFood && (
-        <div className="px-4 mt-3 space-y-2">
-          {/* 时段 */}
-          <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none">
-            <span className="text-[11px] text-muted/40 mr-1 flex-shrink-0">时段</span>
-            {MEAL_CHIPS.map((chip) => (
-              <button
-                key={chip.key}
-                onClick={() => setMealType(chip.key)}
-                className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
-                  mealType === chip.key
-                    ? "bg-vibe-dusk text-white shadow-sm"
-                    : "bg-white/70 text-muted hover:bg-white hover:text-charcoal/70 border border-white/80"
-                }`}
-              >
-                {chip.label}
-              </button>
-            ))}
-          </div>
-          {/* 菜系 */}
-          <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none">
-            <span className="text-[11px] text-muted/40 mr-1 flex-shrink-0">菜系</span>
-            {CUISINE_CHIPS.map((chip) => (
-              <button
-                key={chip.key}
-                onClick={() => setCuisine(chip.key)}
-                className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
-                  cuisine === chip.key
-                    ? "bg-vibe-sea text-white shadow-sm"
-                    : "bg-white/70 text-muted hover:bg-white hover:text-charcoal/70 border border-white/80"
-                }`}
-              >
-                {chip.label}
-              </button>
-            ))}
-          </div>
-          {/* 清除筛选 */}
-          {(mealType || cuisine) && (
-            <button
-              onClick={() => { setMealType(""); setCuisine(""); }}
-              className="flex items-center gap-1 text-[11px] text-muted/50 hover:text-charcoal/60 transition-colors"
-            >
-              <X className="w-3 h-3" /> 清除筛选
-            </button>
-          )}
-        </div>
-      )}
-
       {/* ── 内容区 ── */}
       <div className="flex-1 px-4 py-4 space-y-3 pb-28">
         <p className="text-xs text-muted/70">{CAT_DESC[activeCategory]}</p>
@@ -588,7 +498,7 @@ export default function DiscoverPage() {
           </div>
         ) : (
           <AnimatePresence mode="wait">
-            <motion.div key={activeCategory + mealType + cuisine} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-2.5">
+            <motion.div key={activeCategory} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-2.5">
               {currentCards.map((card) => (
                 <div key={card.id} id={`card-${card.id}`}>
                   <PoiCard card={card} onToggle={() => handleToggle(card)} />

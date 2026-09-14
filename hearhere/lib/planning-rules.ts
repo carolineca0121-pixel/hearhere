@@ -62,6 +62,13 @@ export function resolvePlanningRules(tags: Record<string, unknown>): PlanningCon
   return ctx;
 }
 
+/** 户外型卡片判断（MVP 启发式：attraction 且名称/描述无室内线索）。天气 warning 与 P4 放置提醒共用。 */
+export function isOutdoorishCard(card: { category?: string; title?: string; description?: string; activity?: string }): boolean {
+  const indoorHint = /馆|室内|博物|商城|书店|茶|影院|浴|温泉/;
+  return (card.category ?? "attraction") === "attraction" &&
+    !indoorHint.test(`${card.title ?? card.activity ?? ""} ${card.description ?? ""}`);
+}
+
 /**
  * E4-4 天气 soft rule（可注入测试）：雨天白天 + 户外型景点 → warning。
  * 只产出提示，绝不修改 placements；用户手动项不在 placementsByDay 中，天然不受影响。
@@ -72,17 +79,13 @@ export function weatherWarnings(
   rainyDays: Set<number>
 ): string[] {
   if (rainyDays.size === 0) return [];
-  const indoorHint = /馆|室内|博物|商城|书店|茶|影院|浴|温泉/;
   const out: string[] = [];
   for (const [d, items] of Object.entries(placementsByDay)) {
     const dayNum = Number(d);
     if (!rainyDays.has(dayNum)) continue;
     for (const it of items) {
       const card = cards.find((c) => c.id === it.cardId);
-      const isOutdoorish =
-        (card?.category ?? "attraction") === "attraction" &&
-        !indoorHint.test(`${it.activity} ${card?.description ?? ""}`);
-      if (isOutdoorish) {
+      if (isOutdoorishCard({ category: card?.category, title: it.activity, description: card?.description })) {
         out.push(`Day ${dayNum} 白天有雨，「${it.activity}」可能受天气影响，建议关注天气或准备雨具`);
       }
     }

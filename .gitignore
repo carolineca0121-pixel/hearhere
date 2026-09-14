@@ -17,6 +17,9 @@ build/
 .env.development.local
 .env.test.local
 .env.production.local
+# Secret-bearing local files（E4.5 Release Prep：含真实密钥/变量值，永不入库）
+.env.backup-*
+vercel-env-*.txt
 
 # Database
 *.db

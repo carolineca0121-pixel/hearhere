@@ -237,6 +237,14 @@ export default function ConfirmPage() {
   const [reExtractSuccess, setReExtractSuccess] = useState(false);
   const mediaRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  // ── E4.5 Phase 4-1：酒店 POI 精确选择（模糊文本绝不落 hotel 字段） ──
+  const [hotelQuery, setHotelQuery] = useState("");
+  const [hotelCandidates, setHotelCandidates] = useState<{ id: string; name: string; address: string; district?: string; lng: number; lat: number }[]>([]);
+  const [hotelSearching, setHotelSearching] = useState(false);
+  const [hotelPrompt, setHotelPrompt] = useState(false); // E4.5 Phase 4-2：未定具体门店时的内联提示（非硬阻断）
+  const hotelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hotelInputRef = useRef<HTMLInputElement | null>(null);
+  const hotelSectionRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!_hydrated) return;
@@ -370,7 +378,49 @@ export default function ConfirmPage() {
     } finally { setReExtracting(false); }
   };
 
-  const goNext = () => router.push("/discover");
+  // 酒店搜索（400ms debounce → 复用现有 /api/poi/search，hotel 类别）
+  const searchHotel = (q: string) => {
+    setHotelQuery(q);
+    if (hotelTimerRef.current) clearTimeout(hotelTimerRef.current);
+    if (!q.trim()) { setHotelCandidates([]); return; }
+    hotelTimerRef.current = setTimeout(async () => {
+      setHotelSearching(true);
+      try {
+        const res = await fetch(`/api/poi/search?city=${encodeURIComponent(tags?.destination || "")}&keywords=${encodeURIComponent(q.trim())}&categories=hotel&limit=8`);
+        const data = await res.json();
+        setHotelCandidates(Array.isArray(data.pois) ? data.pois : []);
+      } catch { setHotelCandidates([]); }
+      finally { setHotelSearching(false); }
+    }, 400);
+  };
+
+  const chooseHotel = (p: { id: string; name: string; address: string; district?: string; lng: number; lat: number }) => {
+    setTags({
+      ...tags,
+      hotelStatus: "已定酒店",
+      hotel: { name: p.name, address: p.address || "", district: p.district, location: { lng: p.lng, lat: p.lat }, amapId: p.id },
+    });
+    setHotelCandidates([]);
+    setHotelQuery("");
+    setHotelPrompt(false);
+  };
+
+  const clearHotel = () => {
+    const next = { ...tags };
+    delete next.hotel;
+    setTags(next);
+    setHotelQuery("");
+    setHotelCandidates([]);
+  };
+
+  const goNext = () => {
+    // E4.5 Phase 4-2 契约：已定酒店但未选具体 POI → 不硬阻断，显示内联提示（去选择酒店 / 继续不填写）
+    if (tags?.hotelStatus === "已定酒店" && !tags?.hotel) {
+      setHotelPrompt(true);
+      return;
+    }
+    router.push("/discover");
+  };
 
   // ── 路径C：开始智能规划 —— 并发识别暂存截图（Promise.all，严禁排队），合并后进入 Page 3 ──
   const handleSmartPlan = async () => {
@@ -732,15 +782,27 @@ export default function ConfirmPage() {
             </div>
           </div>
 
-          {/* 酒店 */}
+          {/* 酒店（E4.5：方案二——保留酒店信息输入，删除「需要推荐」；本阶段不做酒店推荐） */}
           <div className="flex items-start gap-2">
             <span className="text-xs text-muted mt-1 min-w-[5rem]">🏨 酒店</span>
             <div className="flex flex-wrap gap-1.5">
-              {["已定酒店", "需要推荐"].map((opt) => (
+              {["已定酒店", "暂不需要"].map((opt) => (
                 <button
                   key={opt}
                   type="button"
-                  onClick={() => fillTripDetail("hotelStatus", opt)}
+                  onClick={() => {
+                    // 单次合并 setTags：避免 fillTripDetail + clearHotel 两次 setTags 造成旧状态覆盖（stale closure）
+                    if (opt === "已定酒店") {
+                      fillTripDetail("hotelStatus", opt);
+                    } else {
+                      const next = { ...tags, hotelStatus: opt };
+                      delete next.hotel;
+                      setTags(next);
+                      setHotelQuery("");
+                      setHotelCandidates([]);
+                    }
+                    setHotelPrompt(false);
+                  }}
                   className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs transition-colors ${
                     tags.hotelStatus === opt
                       ? "bg-vibe-forest/20 border-vibe-forest/40 text-charcoal"
@@ -752,6 +814,50 @@ export default function ConfirmPage() {
               ))}
             </div>
           </div>
+
+          {/* E4.5 Phase 4-1：已定酒店 → 高德 POI 精确选择（候选→用户点选→确认态） */}
+          {tags.hotelStatus === "已定酒店" && (
+            <div ref={hotelSectionRef} className="ml-[5.5rem] space-y-2">
+              {tags.hotel ? (
+                <div className="rounded-xl bg-vibe-forest/10 border border-vibe-forest/25 px-3 py-2">
+                  <p className="text-xs text-charcoal/85">✓ 已选择</p>
+                  <p className="text-sm font-medium text-charcoal">{tags.hotel.name}</p>
+                  <p className="text-[11px] text-muted/70">{tags.hotel.district ? `${tags.hotel.district} · ` : ""}{tags.hotel.address}</p>
+                  <button type="button" onClick={clearHotel} className="mt-1 text-[11px] text-vibe-sea hover:underline">更换</button>
+                </div>
+              ) : (
+                <div>
+                  <input
+                    ref={hotelInputRef}
+                    value={hotelQuery}
+                    onChange={(e) => searchHotel(e.target.value)}
+                    placeholder="搜索酒店，例如：全季酒店"
+                    className="w-full rounded-xl border border-vibe-dusk/20 bg-white/60 px-3 py-2 text-sm outline-none focus:border-vibe-sea/50"
+                  />
+                  {hotelSearching && <p className="mt-1 text-[11px] text-muted/60">搜索中…</p>}
+                  {hotelCandidates.length > 0 && (
+                    <div className="mt-1.5 space-y-1">
+                      {hotelCandidates.map((p) => (
+                        <button
+                          key={p.id || p.name + p.address}
+                          type="button"
+                          onClick={() => chooseHotel(p)}
+                          className="w-full text-left rounded-xl bg-white/70 border border-vibe-dusk/15 px-3 py-2 hover:bg-white transition-colors"
+                        >
+                          <p className="text-xs font-medium text-charcoal/90">{p.name}</p>
+                          <p className="text-[11px] text-muted/70">{p.district}{p.address}</p>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {hotelQuery.trim() && !hotelSearching && hotelCandidates.length === 0 && (
+                    <p className="mt-1 text-[11px] text-muted/60">没有找到匹配酒店，请换关键词；或改选「暂不需要」。</p>
+                  )}
+                  <p className="mt-1 text-[10px] text-muted/50">请从搜索结果中选择具体门店，不要只输入文字。</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </GlassCard>
 
@@ -772,9 +878,39 @@ export default function ConfirmPage() {
             )}
           </Button>
         ) : (
-          <Button onClick={goNext} disabled={loading}>
-            确认并继续
-          </Button>
+          <div className="w-full space-y-2">
+            {/* E4.5 Phase 4-2：已定酒店但未选具体 POI → 内联提示（非硬阻断） */}
+            {hotelPrompt && (
+              <div className="rounded-xl bg-amber-50/80 border border-amber-200/60 px-3 py-2.5">
+                <p className="text-[11px] leading-relaxed text-amber-800">
+                  ⚠️ 你已选择「已定酒店」，但尚未选择具体地点。如果不选择，AI 将不会使用酒店位置进行路线建议。
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHotelPrompt(false);
+                      hotelSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      setTimeout(() => hotelInputRef.current?.focus(), 350);
+                    }}
+                    className="rounded-full bg-vibe-sea/15 border border-vibe-sea/30 px-3 py-1 text-xs text-charcoal hover:bg-vibe-sea/25"
+                  >
+                    去选择酒店
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setHotelPrompt(false); router.push("/discover"); }}
+                    className="rounded-full border border-vibe-dusk/20 bg-white/50 px-3 py-1 text-xs text-muted hover:bg-white"
+                  >
+                    继续不填写
+                  </button>
+                </div>
+              </div>
+            )}
+            <Button onClick={goNext} disabled={loading}>
+              确认并继续
+            </Button>
+          </div>
         )}
       </div>
     </div>

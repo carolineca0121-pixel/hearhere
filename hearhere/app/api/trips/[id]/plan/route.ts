@@ -13,7 +13,7 @@ import {
 } from "@/lib/plan-normalizer";
 import { occupiedIntervalsFor } from "@/lib/duration";
 import { resolvePlanningRules, weatherWarnings, alignWeatherToTripDays } from "@/lib/planning-rules";
-import { geoFactsFor, farPairWarnings } from "@/lib/geo";
+import { geoFactsFor, farPairWarnings, hotelFactsFor } from "@/lib/geo";
 import { getWeather } from "@/lib/amap";
 import type { DayPlanItem } from "@/lib/types";
 
@@ -176,6 +176,15 @@ export async function POST(
       anchors,
       ruleHints: rulesCtx.promptHints,
       geoFacts: geoFactsFor(cards.map((c) => ({ title: c.title, location: c.location }))),
+      // E4.5 Phase 5：酒店 soft spatial anchor（用户确认的 L2 事实 → 仅注入 prompt 供建议参考，绝不进 editDays）
+      hotelFacts: hotelFactsFor(
+        (() => {
+          const h = (tags as { hotel?: { name?: unknown; district?: unknown; location?: { lng?: unknown; lat?: unknown } } }).hotel;
+          if (!h || typeof h.name !== "string" || !h.location || typeof h.location.lng !== "number" || typeof h.location.lat !== "number") return null;
+          return { name: h.name, district: typeof h.district === "string" ? h.district : undefined, location: { lng: h.location.lng, lat: h.location.lat } };
+        })(),
+        cards.map((c) => ({ title: c.title, location: c.location }))
+      ),
       weatherFacts,
       skeletonFacts: {
         goLabel: goT?.activity,

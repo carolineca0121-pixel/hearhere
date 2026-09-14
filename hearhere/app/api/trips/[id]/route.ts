@@ -55,6 +55,17 @@ export async function PUT(
         data: { content: JSON.stringify(d.items ?? []) },
       });
     }
+    // E4.5 Phase 2：可选写入 aiSuggestions（preferences JSON 内嵌字段，无 schema 变更）。
+    // 互不覆盖契约：只传 days → preferences 不动；只传 aiSuggestions → days 不动。
+    if (body.aiSuggestions && typeof body.aiSuggestions === "object") {
+      let pref: Record<string, unknown> = {};
+      try { pref = JSON.parse(trip.preferences || "{}"); } catch { pref = {}; }
+      pref.aiSuggestions = body.aiSuggestions;
+      await prisma.trip.update({
+        where: { id: trip.id },
+        data: { preferences: JSON.stringify(pref) },
+      });
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error("[trips PUT]", e);

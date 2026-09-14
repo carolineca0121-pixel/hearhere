@@ -149,8 +149,8 @@ function buildCanvasSkeleton(args: {
       });
     }
 
-    // Day 1 酒店入住（仅在用户确认过酒店信息时生成）
-    if (d === 1 && tags.hotelStatus) {
+    // Day 1 酒店入住（E4.5 Phase 5 修复：仅「已定酒店」生成；「暂不需要」字符串为 truthy，原判断会把入住项错误塞入骨架）
+    if (d === 1 && tags.hotelStatus === "已定酒店") {
       items.push({
         time: hasLeg ? padHour(arrivalHour) : "14:00",
         activity: "酒店办理入住",
@@ -200,7 +200,7 @@ function buildCanvasSkeleton(args: {
   }
 
   return {
-    planningThought: tags.hotelStatus
+    planningThought: tags.hotelStatus === "已定酒店"
       ? "画布模式：已为你锁定往返交通与酒店入住，其余时段留白，由你亲手填充。"
       : "画布模式：已为你搭好行程骨架，其余时段留白，由你亲手填充。",
     title: `${destination}${dayCount}日自定义画布`,

@@ -29,6 +29,29 @@ export function haversineKm(a: GeoPoint | null | undefined, b: GeoPoint | null |
  */
 export const FAR_PAIR_KM = 25;
 
+/**
+ * E4.5 Phase 5：酒店 soft spatial anchor 事实（供 prompt，不进 editDays）。
+ * 最近 3 + 最远 3（去重、按距离稳定排序、同距按 title 排序——确定性输出）；
+ * 酒店无坐标或卡片无坐标时跳过对应项。
+ */
+export function hotelFactsFor(
+  hotel: { name: string; district?: string; location?: GeoPoint | null } | null | undefined,
+  cards: { title: string; location?: GeoPoint | null }[]
+): string[] {
+  if (!hotel?.location) return [];
+  const measured = cards
+    .map((c) => ({ title: c.title, km: haversineKm(hotel.location, c.location) }))
+    .filter((x): x is { title: string; km: number } => x.km !== null)
+    .sort((a, b) => a.km - b.km || a.title.localeCompare(b.title, "zh-Hans-CN"));
+  if (measured.length === 0) return [];
+  const picked = new Map<string, number>();
+  for (const x of measured.slice(0, 3)) picked.set(x.title, x.km);          // 最近 3
+  for (const x of measured.slice(-3)) picked.set(x.title, x.km);             // 最远 3（重叠去重）
+  const lines = [`酒店：${hotel.name}${hotel.district ? `（位于${hotel.district}）` : ""}`];
+  picked.forEach((km, title) => lines.push(`- ${title}：距酒店约 ${km.toFixed(1)}km`));
+  return lines;
+}
+
 /** 生成白名单两两距离事实（供 prompt）。格式：「A↔B≈4.2km」。缺坐标的对跳过。 */
 export function geoFactsFor(cards: { title: string; location?: GeoPoint | null }[]): string[] {
   const facts: string[] = [];

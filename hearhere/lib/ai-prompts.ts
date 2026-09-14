@@ -753,6 +753,8 @@ export interface PlanPromptArgs {
   geoFacts?: string[];
   /** E4-4 天气事实（如「Day2（08-29）白天大雨」）；获取失败时缺省（graceful degradation） */
   weatherFacts?: string[];
+  /** E4.5 Phase 5：酒店 soft spatial anchor 事实（「酒店：xxx（位于xx区）」+ 最近/最远各3距离行）；无酒店时缺省，prompt 不出现任何酒店字样 */
+  hotelFacts?: string[];
 }
 
 export function planPrompt(args: PlanPromptArgs): string {
@@ -785,6 +787,9 @@ export function planPrompt(args: PlanPromptArgs): string {
 - 返程：${skeletonFacts.backTime ? `Day ${dayCount} ${skeletonFacts.backTime} ${skeletonFacts.backLabel ?? "返程"}` : `Day ${dayCount} 返程`}（${anchors.lastDayLatestHour}:00 之后不能再安排）
 - 偏好：${prefs}
 - 约束：${cons}
+${(args.hotelFacts ?? []).length > 0 ? `- 住宿事实（用户已确认的酒店，仅作空间参考）：
+${(args.hotelFacts ?? []).join("\n")}
+注意：酒店仅用于判断地点间的空间关系、当天首尾活动的合理性与路线距离。不要围绕酒店强制安排每日路线，不要把酒店当作行程活动，不要假设用户每天必须在固定时间返回酒店。` : ""}
 ${rawUserText ? `- 用户原话：「${rawUserText}」` : ""}
 
 # 可安排的卡片白名单（只能从中选择，禁止任何白名单外的地点）

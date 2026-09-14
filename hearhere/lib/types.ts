@@ -29,7 +29,15 @@ export interface ExtractedTags {
   // ── 行程细节（第二页确认） ──
   departureTime?: string;    // 出发时间: "早上" | "中午" | "下午"
   returnTime?: string;       // 返程偏好: "午饭后" | "一早"
-  hotelStatus?: string;      // 酒店: "已定" | "需要推荐"
+  hotelStatus?: string;      // 酒店: "已定酒店" | "暂不需要"（E4.5 方案二：删除「需要推荐」，本阶段不做酒店推荐）
+  /** E4.5 Phase 4-1：用户通过高德 POI 选择的具体酒店（精确地点，不接受模糊文本） */
+  hotel?: {
+    name: string;
+    address?: string;
+    district?: string;
+    location: { lng: number; lat: number };
+    amapId?: string;
+  };
   // ── 用户自定义精确时间（可选，优先级高于模糊标签） ──
   departureTimeVal?: string; // 精确出发时间，如 "05:30"
   returnTimeVal?: string;    // 精确返程时间，如 "13:00"

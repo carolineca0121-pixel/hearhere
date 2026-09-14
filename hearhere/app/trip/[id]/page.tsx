@@ -8,7 +8,11 @@ import { BreathButton } from "@/components/voice/breath-button";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import type { VibeTheme, DayPlanItem } from "@/lib/types";
 import type { NormalizeResult } from "@/lib/plan-normalizer";
+import { suggestionFingerprint, resultToSuggestions, readSuggestionsFromPreferences, suggestionLabel, suggestedTimeToPeriod, type AiSuggestions } from "@/lib/suggestions";
 import { occupiedIntervalsFor, minutesToTime, intervalOverlaps, timeToMinutes } from "@/lib/duration";
+import { inMealWindow } from "@/lib/plan-normalizer";
+import { isOutdoorishCard } from "@/lib/planning-rules";
+import { haversineKm, FAR_PAIR_KM } from "@/lib/geo";
 import { getMicErrorMessage } from "@/lib/mic";
 import {
   Clock, Bus, Coins, Lightbulb, Sparkles, MapPin,
@@ -75,6 +79,7 @@ type PoolCard = {
   title: string;
   description?: string;
   reason?: string;
+  category?: string; // E4.5：「我的选择」按类别分组（attraction/food/souvenir；缺失默认景点组）
   location?: { lng?: number; lat?: number; address?: string };
 };
 /** 已放置项 vs 卡片池卡：item 带 cardId 时必须精确匹配（同名不同卡不误伤）；item 不带时按 title 兜底（兼容旧 trip） */
@@ -122,7 +127,8 @@ export default function TripPage() {
   const [adjusting, setAdjusting] = useState(false);
   const [adjustText, setAdjustText] = useState("");
   const [expandedDays, setExpandedDays] = useState<Set<number>>(new Set([1]));
-  const [thoughtExpanded, setThoughtExpanded] = useState(true);
+  const [thoughtExpanded, setThoughtExpanded] = useState(false); // E4.5 Phase 6-1：L2 状态条默认收起
+  const [weatherExpanded, setWeatherExpanded] = useState(false); // E4.5 Phase 6-1：天气默认紧凑单行，点击展开预报
   // 🎨 自定义画布：placeholder 占位卡的内联编辑
   const [activePlaceholder, setActivePlaceholder] = useState<string | null>(null);
   const [placeholderText, setPlaceholderText] = useState("");
@@ -130,7 +136,7 @@ export default function TripPage() {
   const [nearbyKey, setNearbyKey] = useState<string | null>(null);
   const [nearbyList, setNearbyList] = useState<{ name: string; type: string; distance: number }[]>([]);
   const [nearbyLoading, setNearbyLoading] = useState(false);
-  // ── 2.0 攻略卡：可编辑时间轴 + 卡片池 + 打卡清单 ──
+  // ── 2.0 攻略卡：可编辑时间轴 + 卡片池 ──
   const [editDays, setEditDays] = useState<Record<number, DayPlanItem[]>>({});
   const [pickedCard, setPickedCard] = useState<PoolCard | null>(null);
   const dragCardRef = useRef<PoolCard | null>(null);
@@ -146,7 +152,6 @@ export default function TripPage() {
     const t = setTimeout(() => setConflictNotice(""), 6000);
     return () => clearTimeout(t);
   }, [conflictNotice]);
-  const [checkedSpots, setCheckedSpots] = useState<Set<string>>(new Set());
   const [weather, setWeather] = useState<WeatherData | null>(null);
   // 分享
   const [sharing, setSharing] = useState(false);
@@ -191,30 +196,21 @@ export default function TripPage() {
     setEditDays(map);
   }, [trip]);
 
-  // ── E3-3：画布就绪后自动请求 AI 初稿（仅 pristine 画布；闸门与并发锁在 runAiPlan 内） ──
+  // ── E4.5 Phase 2：trip 加载后读取/生成 AI 建议（建议层与时间轴解耦，无需等 editDays） ──
+  // 已有建议且 fingerprint 匹配 → 直接复用（不调 LLM）；否则生成一次。
   useEffect(() => {
     if (!trip) return;
-    if (Object.keys(editDays).length === 0) return; // 等 editDays 初始化完成
-    triggerAiPlan();
+    if (planAutoDoneRef.current) return;
+    const existing = readSuggestionsFromPreferences(trip.preferences);
+    if (existing && existing.fingerprint === currentFingerprint) {
+      setAiSuggestions(existing);
+      planAutoDoneRef.current = true;
+      return;
+    }
+    planAutoDoneRef.current = true;
+    void runAiPlan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trip, editDays]);
-
-  // 打卡清单：按行程持久化到 localStorage
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(`hh-checklist-${id}`);
-      if (raw) setCheckedSpots(new Set(JSON.parse(raw)));
-    } catch { /* ignore */ }
-  }, [id]);
-
-  const toggleSpot = (t: string) => {
-    setCheckedSpots((prev) => {
-      const next = new Set(prev);
-      if (next.has(t)) next.delete(t); else next.add(t);
-      try { localStorage.setItem(`hh-checklist-${id}`, JSON.stringify(Array.from(next))); } catch { /* ignore */ }
-      return next;
-    });
-  };
+  }, [trip]);
 
   // E3-3：返回值标识 PUT 是否成功（AI 自动规划必须区分「规划失败」与「保存失败」）；
   // 原有调用方（placeCard/removePlacedItem）忽略返回值，行为不变。
@@ -237,20 +233,57 @@ export default function TripPage() {
   // 把卡片池中的卡放进某天某小时（同一地点重复放置会自动移动）
   // E1b：接收完整卡片，写入 cardId/origin/lng/lat（activity 用卡片原始 title，坐标从 selectedCards.location 复制）
   // 冲突策略：允许放置（用户主权），但与已占用区间（交通等长项）冲突时给出明确警告并打 userOverride 标记
+  // E4.5 Gate：cardId 在整个行程内唯一——放置前从「所有 Day」移除该卡旧位置（移动语义，不是复制）
+  // E4.5 Phase 3-2：放置时检查 天气/饭点/距离——全部 warning-only，永不阻止用户
   const placeCard = (dayIndex: number, hour: number, card: PoolCard) => {
     const next = { ...editDays };
-    const items = (next[dayIndex] ?? []).filter((it) => !placedItemMatchesCard(it, card));
-    // 冲突检测：放置时段（按 1h 估）与已有占用区间（maxHours 口径）是否相交
+    for (const d of Object.keys(next)) {
+      next[Number(d)] = (next[Number(d)] ?? []).filter((it) => !placedItemMatchesCard(it, card));
+    }
+    const items = next[dayIndex] ?? [];
     const startMin = hour * 60;
+    const timeStr = `${String(hour).padStart(2, "0")}:00`;
+
+    const warns: string[] = [];
+    // ① 交通占用冲突（既有）
     const conflict = occupiedIntervalsFor(items, dayIndex, true)
       .find((iv) => intervalOverlaps(startMin, 60, iv));
+    if (conflict) {
+      warns.push(`与「${conflict.label}」（${minutesToTime(conflict.startMin)}-${minutesToTime(conflict.endMin)}）时间冲突`);
+    }
+    // ② 天气：目标日预报不利 + 户外型卡片（Day N ≈ 预报第 N 天，无具体日期时的近似，仅提示）
+    const fc = weather?.forecasts?.[dayIndex - 1];
+    if (fc && /雨|雪|雷|冰雹/.test(fc.dayWeather) && isOutdoorishCard({ category: card.category, title: card.title, description: card.description })) {
+      warns.push(`Day ${dayIndex} 白天${fc.dayWeather}，「${card.title}」属于户外安排，建议考虑调整日期或准备雨具`);
+    }
+    // ③ 饭点：美食卡落在窗外 / 非美食卡占用午晚餐时段
+    const lunch = startMin >= 11 * 60 && startMin < 13.5 * 60;
+    const dinner = startMin >= 17.5 * 60 && startMin < 19.5 * 60;
+    if (card.category === "food" && !inMealWindow(timeStr)) {
+      warns.push(`「${card.title}」安排在 ${timeStr}，不在常规用餐时段，建议留意`);
+    } else if (card.category !== "food" && (lunch || dinner)) {
+      warns.push(`${timeStr} 接近${lunch ? "午" : "晚"}餐时段，建议预留用餐时间`);
+    }
+    // ④ 距离：与当天前一有坐标的活动直线距离过远
+    if (card.location?.lng != null && card.location?.lat != null) {
+      const prev = items
+        .filter((it) => it.lng != null && it.lat != null && timeToMinutes(it.time) !== null && (timeToMinutes(it.time) as number) <= startMin)
+        .sort((a, b) => (timeToMinutes(b.time) ?? 0) - (timeToMinutes(a.time) ?? 0))[0];
+      if (prev) {
+        const km = haversineKm({ lng: prev.lng, lat: prev.lat }, card.location);
+        if (km !== null && km > FAR_PAIR_KM) {
+          warns.push(`这里距离上一站「${prev.activity}」直线约 ${km.toFixed(0)}km，当天移动可能较赶`);
+        }
+      }
+    }
+
     items.push({
-      time: `${String(hour).padStart(2, "0")}:00`,
+      time: timeStr,
       activity: card.title,
       source: "selected_card",
       ...(card.id ? { cardId: card.id } : {}),
       origin: "user",
-      ...(conflict ? { userOverride: true } : {}),
+      ...(warns.length > 0 ? { userOverride: true } : {}),
       ...(card.location?.lng != null && card.location?.lat != null
         ? { lng: card.location.lng, lat: card.location.lat }
         : {}),
@@ -259,10 +292,8 @@ export default function TripPage() {
     next[dayIndex] = items;
     setEditDays(next);
     setPickedCard(null);
-    if (conflict) {
-      setConflictNotice(
-        `⚠️「${card.title}」与「${conflict.label}」（${minutesToTime(conflict.startMin)}-${minutesToTime(conflict.endMin)}）时间冲突，已按你的选择保留，可再调整`
-      );
+    if (warns.length > 0) {
+      setConflictNotice(`⚠️ AI 提醒：${warns.join("；")}。已按你的选择保留，可再调整`);
     }
     persistDays(next);
   };
@@ -275,71 +306,51 @@ export default function TripPage() {
     persistDays(next);
   };
 
-  // ── E3-3：AI 初稿自动规划（首入 pristine 画布时触发一次） ──
-  // 契约：/plan 只读返回 NormalizeResult；这里只负责「应用 + 落库 + 状态反馈」。
+  // ── E4.5 Phase 2：AI 建议层（首入时生成一次；建议与时间轴严格分离，永不写入 editDays） ──
+  // 契约：/plan 只读返回 NormalizeResult → 转换为 AiSuggestions → state + preferences.aiSuggestions 持久化。
   const planInFlightRef = useRef(false);   // 并发锁（StrictMode 双挂载/快速重入）
   const planAutoDoneRef = useRef(false);   // 本页面生命周期内自动触发只试一次
+  const [aiSuggestions, setAiSuggestions] = useState<AiSuggestions | null>(null);
 
-  /** 应用 AI placements：一次性构造完整 nextDays（禁止按天连续 setEditDays），一次 PUT 落库。 */
-  const applyAiPlacements = async (result: NormalizeResult): Promise<boolean> => {
-    const placed = Object.entries(result.placementsByDay ?? {}).flatMap(([d, items]) =>
-      (items ?? []).map((item) => ({ dayIndex: Number(d), item }))
-    );
-    if (placed.length === 0) return false; // 空结果：不动画布（调用方按「轻提示」处理，不算失败）
-
-    // 客户端白名单再校验一层：cardId → 真实 selectedCard，activity/坐标以真实卡为准重写
-    // （服务端 normalizeAiPlan 已做过，这里是第二道防线：不信任任何网络往返内容）
-    let whitelist: PoolCard[] = [];
+  /** 当前规划输入指纹（selectedCards + 出发/返程时间 + 天数）；与建议的 fingerprint 不一致 → 建议失效 */
+  const currentFingerprint = (() => {
+    if (!trip) return "";
     try {
-      const pref = JSON.parse(trip?.preferences || "{}");
-      whitelist = (Array.isArray(pref.selectedCards) ? pref.selectedCards : [])
-        .filter((c: any) => c && typeof c.title === "string" && c.title);
-    } catch { whitelist = []; }
+      const pref = JSON.parse(trip.preferences || "{}");
+      const tags = pref.tags ?? {};
+      const cards = Array.isArray(pref.selectedCards) ? pref.selectedCards : [];
+      return suggestionFingerprint({
+        cardIds: cards.map((c: any) => c?.id ?? (c?.title ? `t:${c.title}` : undefined)),
+        departureTime: tags.departureTime,
+        departureTimeVal: tags.departureTimeVal,
+        returnTime: tags.returnTime,
+        returnTimeVal: tags.returnTimeVal,
+        days: typeof tags.days === "number" ? tags.days : trip.itineraries?.length,
+        hotel: tags.hotel ?? null, // E4.5 Phase 5：/plan 已消费 hotel，指纹同步含 hotel 分量
+      });
+    } catch { return ""; }
+  })();
 
-    const next: Record<number, DayPlanItem[]> = {};
-    for (const [d, items] of Object.entries(editDays)) {
-      // D2：成功应用非空 plan → 拆除整趟 placeholder 脚手架；transport/rest/其他一律保留
-      next[Number(d)] = (items ?? []).filter((it) => it?.source !== "placeholder");
+  /** 建议落库：NormalizeResult → AiSuggestions → state + PUT {aiSuggestions}（绝不写 days/editDays） */
+  const storeAiSuggestions = async (result: NormalizeResult): Promise<boolean> => {
+    const sug = resultToSuggestions(result, currentFingerprint);
+    setAiSuggestions(sug);
+    try {
+      const res = await fetch(`/api/trips/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aiSuggestions: sug }),
+      });
+      return res.ok;
+    } catch {
+      return false;
     }
-    for (const { dayIndex, item } of placed) {
-      let finalItem = item;
-      if (item.cardId) {
-        const card = whitelist.find((c) => c.id === item.cardId);
-        if (!card) continue; // 非白名单 cardId → 丢弃（双保险，不进画布）
-        // activity/lng/lat 以真实卡为准（AI 无权决定）；source/origin 强制契约值
-        finalItem = {
-          ...item,
-          activity: card.title,
-          source: "selected_card",
-          origin: "ai",
-          ...(card.location?.lng != null && card.location?.lat != null
-            ? { lng: card.location.lng, lat: card.location.lat }
-            : {}),
-        };
-      }
-      const dayItems = next[dayIndex] ?? (next[dayIndex] = []);
-      // 用户安排优先：画布已有同 cardId 项 → 跳过（不覆盖/不改写/不重复）
-      if (finalItem.cardId && dayItems.some((ex) => ex.cardId && ex.cardId === finalItem.cardId)) continue;
-      // 防御跨天重复（normalizer 已保证一卡一次，此处双保险）
-      if (finalItem.cardId && Object.values(next).flat().some((ex) => ex.cardId && ex.cardId === finalItem.cardId)) continue;
-      // AI 的 day/time 原样使用，不重算不打平（14:30 必须仍是 14:30）
-      dayItems.push(finalItem);
-      dayItems.sort((a, b) => (a.time || "").localeCompare(b.time || "")); // 复用现有排序规则
-    }
-    // 防御：白名单过滤后实际无任何可应用项 → 视为空结果，不动画布
-    const appliedCount = Object.values(next).flat().filter((it) => it?.origin === "ai").length;
-    if (appliedCount === 0) return false;
-    setEditDays(next);
-    return await persistDays(next);
   };
 
-  /** 实际执行规划（自动触发与手动重试共用；内含幂等闸门与并发锁） */
+  /** 实际生成建议（自动触发与手动重试共用；内含并发锁） */
   const runAiPlan = async () => {
     if (!trip) return;
     if (planInFlightRef.current) return;
-    // D1 用户主权：画布已有任何 selected_card（user/ai/legacy 无 origin）→ 不自动接管
-    const hasAnyPlaced = Object.values(editDays).flat().some((it) => it?.source === "selected_card");
-    if (hasAnyPlaced) return;
     let hasCards = false;
     try {
       const pref = JSON.parse(trip.preferences || "{}");
@@ -354,19 +365,12 @@ export default function TripPage() {
       const res = await fetch(`/api/trips/${id}/plan`, { method: "POST" });
       if (!res.ok) throw new Error(`plan-http-${res.status}`);
       const result = (await res.json()) as NormalizeResult;
-      const placedCount = Object.values(result.placementsByDay ?? {}).flat().length;
-      if (placedCount === 0) {
-        // 空规划：合法结果而非错误——不动画布、不 PUT、给轻提示
-        setPlanState("idle");
-        setPlanNotice("empty");
-        return;
-      }
-      const ok = await applyAiPlacements(result);
+      const itemCount = Object.values(result.placementsByDay ?? {}).flat().length;
+      const ok = await storeAiSuggestions(result);
       if (ok) {
         setPlanState("idle");
-        setPlanNotice("");
+        setPlanNotice(itemCount === 0 ? "empty" : "");
       } else {
-        // PUT 失败：editDays 已是 optimistic 更新状态（现有保存模式），明确提示保存失败
         setPlanState("failed");
         setPlanErrorKind("save");
       }
@@ -379,27 +383,25 @@ export default function TripPage() {
     }
   };
 
-  /** 自动触发入口：仅 pristine 画布、仅一次 */
-  const triggerAiPlan = () => {
-    if (planAutoDoneRef.current) return;
-    planAutoDoneRef.current = true;
-    void runAiPlan();
-  };
-
-  /** 手动重试：plan 失败重跑规划；save 失败仅重试落库（不重跑 LLM） */
+  /** 手动重试：plan 失败重跑；save 失败仅重试建议落库（不重跑 LLM） */
   const retryAiPlan = () => {
     if (planErrorKind === "save") {
-      if (planInFlightRef.current) return;
+      if (planInFlightRef.current || !aiSuggestions) return;
       planInFlightRef.current = true;
       setPlanState("planning");
-      void persistDays(editDays).then((ok) => {
-        planInFlightRef.current = false;
-        if (ok) { setPlanState("idle"); setPlanErrorKind(""); }
-        else setPlanState("failed");
-      });
+      fetch(`/api/trips/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aiSuggestions }),
+      })
+        .then((res) => {
+          if (res.ok) { setPlanState("idle"); setPlanErrorKind(""); }
+          else setPlanState("failed");
+        })
+        .catch(() => setPlanState("failed"))
+        .finally(() => { planInFlightRef.current = false; });
       return;
     }
-    // runAiPlan 内的 hasAnyPlaced 闸门仍然生效：用户失败后已手动放卡 → 不再调 /plan
     void runAiPlan();
   };
 
@@ -571,12 +573,22 @@ export default function TripPage() {
   let planningThought = "";
   // E1b：读取完整卡片身份（id/title/description/reason/location）；旧数据缺 id/location 也可正常打开
   let prefSelectedCards: PoolCard[] = [];
+  // E4.5 Phase 4-2：酒店事实（tags.hotel = 用户 POI 选择的精确地点；缺失则不展示，legacy 兼容）
+  let prefHotel: { name: string; address?: string; district?: string } | null = null;
   try {
     const pref = JSON.parse(trip.preferences);
     title = pref.title ?? "";
     overview = pref.overview ?? "";
     travelTips = pref.travelTips ?? [];
     planningThought = pref.planningThought ?? "";
+    const h = pref?.tags?.hotel;
+    if (h && typeof h.name === "string" && h.location && typeof h.location.lng === "number" && typeof h.location.lat === "number") {
+      prefHotel = {
+        name: h.name,
+        address: typeof h.address === "string" ? h.address : undefined,
+        district: typeof h.district === "string" ? h.district : undefined,
+      };
+    }
     prefSelectedCards = (Array.isArray(pref.selectedCards) ? pref.selectedCards : [])
       .filter((c: any) => c && typeof c.title === "string" && c.title.length > 0)
       .map((c: any) => ({
@@ -584,6 +596,7 @@ export default function TripPage() {
         title: c.title as string,
         description: c.description,
         reason: c.reason,
+        category: typeof c.category === "string" ? c.category : undefined,
         location: c.location && typeof c.location.lng === "number" && typeof c.location.lat === "number"
           ? { lng: c.location.lng, lat: c.location.lat, address: c.location.address }
           : undefined,
@@ -591,12 +604,11 @@ export default function TripPage() {
   } catch { /* ignore */ }
   const displayTitle = title || `${trip.destination} · 我的旅行攻略`;
 
-  // ── 2.0 攻略卡：卡片池 = 已选卡片 - 已排入时间轴的（E1b：cardId 优先，title 兜底旧数据） ──
-  const selectedCardTitles: string[] = prefSelectedCards.map((c) => c.title);
-  const placedItems = Object.values(editDays).flat();
-  const cardPool = prefSelectedCards.filter(
-    (card) => !placedItems.some((it: any) => placedItemMatchesCard(it ?? {}, card))
+  // ── 2.0 攻略卡：「我的选择」= 全部已选卡（E4.5：卡片不因已安排而消失，状态以标签呈现；按 category 分组） ──
+  const placedItemsWithDay = Object.entries(editDays).flatMap(([d, items]) =>
+    (items ?? []).map((it) => ({ ...it, _day: Number(d) }))
   );
+  const cardPool = prefSelectedCards; // 全量用户选择（不再过滤已安排）
   const totalExpenseAmount = expenses.reduce((s, e) => s + e.amount, 0);
 
   const sortedDays = [...(trip.itineraries ?? [])].sort((a, b) => a.dayIndex - b.dayIndex);
@@ -646,150 +658,52 @@ export default function TripPage() {
           </div>
         </div>
 
-        {/* ── 地图区 ── */}
-        {allMarkers.length > 0 && (
-          <div className="relative">
-            <AmapView markers={allMarkers} className="w-full h-[30vh]" />
-            <div className="absolute bottom-2 left-3">
-              <GlassCard className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs shadow-sm">
-                <MapPin className="w-3 h-3 text-vibe-sea" />
-                <span>{trip.destination} · {allMarkers.length} 个地点</span>
-              </GlassCard>
-            </div>
-          </div>
-        )}
-
-        {/* ── 行程概述 ── */}
-        {overview && (
-          <div className="px-4 pt-4">
-            <GlassCard className="px-4 py-3">
-              <div className="flex items-start gap-2">
-                <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-vibe-dusk" />
-                <p className="text-sm leading-relaxed text-charcoal/80">{overview}</p>
-              </div>
-            </GlassCard>
-          </div>
-        )}
-
-        {/* ── ✨ AI 规划心路历程 ── */}
-        {planningThought && (
-          <div className="px-4 pt-3">
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.15 }}
-              className="rounded-2xl border border-amber-200/60 bg-amber-50/50 backdrop-blur-md shadow-sm overflow-hidden"
-            >
-              <button
-                onClick={() => setThoughtExpanded((v) => !v)}
-                className="w-full flex items-center justify-between px-4 py-3 text-left"
-              >
-                <div className="flex items-center gap-2">
-                  <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-                  <span className="text-xs font-medium text-amber-800/90">
-                    🛎️ 旅行管家手记
-                  </span>
-                </div>
-                <ChevronDown
-                  className={`w-3.5 h-3.5 text-amber-600/70 transition-transform duration-200 ${
-                    thoughtExpanded ? "rotate-180" : ""
-                  }`}
-                />
-              </button>
-              <AnimatePresence initial={false}>
-                {thoughtExpanded && (
-                  <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.25 }}
-                  >
-                    <div className="border-t border-amber-200/40">
-                      <p className="px-4 pt-2.5 text-[11px] text-amber-700/60">
-                        设计细节与避坑考量
-                      </p>
-                      <p className="px-4 pb-4 pt-1.5 text-sm italic leading-relaxed text-amber-900/70">
-                        {planningThought}
-                      </p>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </motion.div>
-          </div>
-        )}
-
-        {/* ── 🛎️ 数据守护横幅 ── */}
+        {/* ── L2 系统状态折叠条（E4.5 Phase 6-1：概述+管家手记+数据守护三合一，默认收起；L0 决策链路优先） ── */}
         <div className="px-4 pt-3">
-          <p className="text-[11px] text-muted/70 text-center leading-relaxed">
-            🛎️ 旅行管家：您之前导入的截图和语音已安全存入本地，随时可以返回首页追加新想法，我们为您守护数据。
-          </p>
+          <div className="rounded-xl border border-amber-200/50 bg-amber-50/40 backdrop-blur-md">
+            <button
+              onClick={() => setThoughtExpanded((v) => !v)}
+              className="w-full flex items-center justify-between px-3.5 py-2 text-left"
+            >
+              <span className="text-[11px] text-amber-800/80">
+                ✦ 行程骨架已准备好，AI 已根据你的选择生成建议
+              </span>
+              <ChevronDown
+                className={`w-3.5 h-3.5 text-amber-600/70 transition-transform duration-200 ${thoughtExpanded ? "rotate-180" : ""}`}
+              />
+            </button>
+            <AnimatePresence initial={false}>
+              {thoughtExpanded && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.25 }}
+                  className="overflow-hidden"
+                >
+                  <div className="border-t border-amber-200/40 px-3.5 py-2.5 space-y-2">
+                    {overview && (
+                      <p className="text-[11px] leading-relaxed text-charcoal/70">{overview}</p>
+                    )}
+                    {planningThought && (
+                      <p className="text-[11px] italic leading-relaxed text-amber-900/70">🛎️ {planningThought}</p>
+                    )}
+                    <p className="text-[11px] text-muted/60 leading-relaxed">
+                      AI 的建议仅供参考，最终安排由你决定。您之前导入的截图和语音已安全存入本地，随时可以返回首页追加新想法。
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
         </div>
 
-        {/* ── 天气条 ── */}
-        {weather && (weather.live || (weather.forecasts?.length ?? 0) > 0) && (
-          <div className="px-4 pt-3">
-            <GlassCard className="px-4 py-3">
-              <div className="flex items-center gap-2 mb-2">
-                <CloudSun className="w-3.5 h-3.5 text-vibe-sea" />
-                <span className="text-xs font-medium text-charcoal/80">
-                  {weather.city}天气
-                </span>
-              </div>
-              {/* 实况 */}
-              {weather.live && (
-                <div className="flex items-center gap-4 mb-2 pb-2 border-b border-white/40">
-                  <div className="flex items-baseline gap-1">
-                    <span className="text-2xl font-semibold text-charcoal">
-                      {weather.live.temperature}°
-                    </span>
-                    <span className="text-xs text-muted">{weather.live.weather}</span>
-                  </div>
-                  <div className="flex items-center gap-3 text-[11px] text-muted/80">
-                    <span className="flex items-center gap-0.5">
-                      <Droplets className="w-3 h-3" />
-                      {weather.live.humidity}%
-                    </span>
-                    <span className="flex items-center gap-0.5">
-                      <Wind className="w-3 h-3" />
-                      {weather.live.windDirection}风 {weather.live.windPower}级
-                    </span>
-                  </div>
-                </div>
-              )}
-              {/* 预报 */}
-              {(weather.forecasts ?? []).length > 0 && (
-                <div className="flex gap-1 overflow-x-auto">
-                  {(weather.forecasts ?? []).slice(0, 4).map((f) => (
-                    <div
-                      key={f.date}
-                      className="flex-1 min-w-[60px] text-center py-1"
-                    >
-                      <p className="text-[10px] text-muted/70">
-                        {f.date.slice(5)} {f.week}
-                      </p>
-                      <p className="text-[11px] text-charcoal/80 my-0.5">
-                        {f.dayWeather}
-                      </p>
-                      <p className="text-[11px]">
-                        <span className="text-blue-500/80">{f.nightTemp}°</span>
-                        <span className="text-muted/40 mx-0.5">/</span>
-                        <span className="text-amber-600/90">{f.dayTemp}°</span>
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </GlassCard>
-          </div>
-        )}
-
-        {/* ── E3-3 AI 规划状态条（规划中/失败重试/空结果提示） ── */}
+        {/* ── AI 建议状态条（建议生成中/失败重试/无建议提示；建议层与时间轴分离） ── */}
         {planState === "planning" && (
           <div className="px-4 pt-3">
             <GlassCard className="px-4 py-2.5 flex items-center gap-2 text-xs text-charcoal/70">
               <span className="animate-pulse">✨</span>
-              <span>AI 正在根据你选的卡片规划行程…</span>
+              <span>AI 正在分析你的选择，生成旅行建议…</span>
             </GlassCard>
           </div>
         )}
@@ -798,8 +712,8 @@ export default function TripPage() {
             <GlassCard className="px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
               <span className="text-red-600">
                 ⚠️ {planErrorKind === "save"
-                  ? "AI 已生成规划，但保存失败，请重试。"
-                  : "AI 暂时无法完成规划，画布已保留当前内容。"}
+                  ? "AI 建议已生成，但保存失败，请重试。"
+                  : "AI 建议暂时生成不了，你的画布不受影响。"}
               </span>
               <button
                 onClick={retryAiPlan}
@@ -813,7 +727,7 @@ export default function TripPage() {
         {planState === "idle" && planNotice === "empty" && (
           <div className="px-4 pt-3">
             <GlassCard className="px-4 py-2.5 text-xs text-muted/70">
-              暂时没有适合自动安排的已选地点，画布由你自由安排 🧺
+              暂时没有可建议的安排，时间轴由你自由安排 🧺
             </GlassCard>
           </div>
         )}
@@ -826,39 +740,112 @@ export default function TripPage() {
           </div>
         )}
 
-        {/* ── 🧺 待安排卡片池（点选或拖入下方时间轴） ── */}
+        {/* ── 🧺 我的选择（按类别分组；已安排的卡保留并显示状态，点选可再次移动） ── */}
         {cardPool.length > 0 && (
           <div className="px-4 pt-3">
             <GlassCard className="px-4 py-3">
               <p className="text-xs font-medium text-charcoal/80 mb-2">
-                🧺 待安排卡片
+                🧺 我的选择
                 <span className="text-muted/60 font-normal ml-1">点一下选中，再点下方时间轴空格放入（桌面端可直接拖拽）</span>
               </p>
-              <div className="flex flex-wrap gap-1.5">
-                {cardPool.map((card) => {
-                  const cardKey = card.id ?? card.title;
-                  const isPicked = pickedCard
-                    ? pickedCard.id && card.id
-                      ? pickedCard.id === card.id
-                      : pickedCard.title === card.title
-                    : false;
+              <div className="space-y-2">
+                {([["attraction", "🎯 景点"], ["food", "🍜 美食"], ["souvenir", "🎁 伴手礼"]] as const).map(([cat, label]) => {
+                  const group = cardPool.filter((c) => (c.category ?? "attraction") === cat);
+                  if (group.length === 0) return null;
                   return (
-                    <button
-                      key={cardKey}
-                      draggable
-                      onDragStart={() => { dragCardRef.current = card; }}
-                      onClick={() => setPickedCard(isPicked ? null : card)}
-                      className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs transition-all ${
-                        isPicked
-                          ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-md scale-105"
-                          : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white"
-                      }`}
-                    >
-                      {card.title}
-                    </button>
+                    <div key={cat}>
+                      <p className="text-[10px] text-muted/60 mb-1">{label} · {group.length}</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.map((card) => {
+                          const cardKey = card.id ?? card.title;
+                          const placed = placedItemsWithDay.find((it) => placedItemMatchesCard(it, card));
+                          const isPicked = pickedCard
+                            ? pickedCard.id && card.id
+                              ? pickedCard.id === card.id
+                              : pickedCard.title === card.title
+                            : false;
+                          return (
+                            <button
+                              key={cardKey}
+                              draggable
+                              onDragStart={() => { dragCardRef.current = card; }}
+                              onClick={() => setPickedCard(isPicked ? null : card)}
+                              className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs transition-all ${
+                                isPicked
+                                  ? "bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white shadow-md scale-105"
+                                  : placed
+                                  ? "bg-emerald-50 text-emerald-800 border border-emerald-200/70"
+                                  : "bg-white/70 text-charcoal/80 border border-vibe-dusk/25 hover:bg-white"
+                              }`}
+                            >
+                              {card.title}
+                              {placed && (
+                                <span className="text-[10px] opacity-75">✓ 已安排 Day {placed._day}{placed.time ? ` ${placed.time}` : ""}</span>
+                              )}
+                              {/* E4.5 Phase 3-1：AI 建议标签（时段词，不显示精确时间；只是建议，不是已安排） */}
+                              {!placed && (() => {
+                                const sug = aiSuggestions?.items.find((i) =>
+                                  (i.cardId && card.id && i.cardId === card.id) || (!i.cardId && i.cardTitle === card.title)
+                                );
+                                return sug ? (
+                                  <span className="text-[10px] text-vibe-sea/90">· AI 建议 {suggestionLabel(sug)}</span>
+                                ) : null;
+                              })()}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   );
                 })}
               </div>
+            </GlassCard>
+          </div>
+        )}
+
+        {/* ── ✨ AI 旅行建议（建议层：与时间轴视觉/语义隔离；仅供参考，不自动落轴） ── */}
+        {aiSuggestions && (aiSuggestions.items.length > 0 || (aiSuggestions.unplaced?.length ?? 0) > 0) && (
+          <div className="px-4 pt-3">
+            <GlassCard className="px-4 py-3 border-vibe-sea/25 bg-vibe-sea/[0.04]">
+              <p className="text-xs font-medium text-charcoal/80 mb-1.5">✨ AI 旅行建议</p>
+              {aiSuggestions.narrative && (
+                <p className="text-[11px] text-muted/80 leading-relaxed mb-2">{aiSuggestions.narrative}</p>
+              )}
+              <div className="space-y-1.5">
+                {aiSuggestions.items.map((item, idx) => {
+                  // E4.5 Phase 7-1：render-time 派生「你已安排」反馈（复用 placedItemMatchesCard/placedItemsWithDay/suggestedTimeToPeriod；不持久化、不改建议数据、不触发 /plan）
+                  const arranged = placedItemsWithDay.find((p) =>
+                    placedItemMatchesCard(p, { id: item.cardId, title: item.cardTitle })
+                  );
+                  const arrangedPeriod = arranged ? suggestedTimeToPeriod(arranged.time) : null;
+                  return (
+                    <div key={`${item.cardId ?? item.cardTitle}-${idx}`} className="rounded-lg bg-white/60 border border-vibe-sea/15 px-2.5 py-1.5">
+                      <p className="text-xs text-charcoal/85">
+                        <span className="font-medium">{item.cardTitle}</span>
+                        <span className="text-vibe-sea/90 ml-1.5">建议 {suggestionLabel(item)}</span>
+                      </p>
+                      {item.reason && (
+                        <p className="text-[10px] text-muted/70 mt-0.5 leading-snug">{item.reason}</p>
+                      )}
+                      {arranged && (
+                        <p className="text-[10px] mt-0.5 text-vibe-forest font-medium">
+                          ✓ 你已安排 Day {arranged._day}{arrangedPeriod ? ` · ${arrangedPeriod}` : ""}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+                {(aiSuggestions.unplaced ?? []).map((u, idx) => (
+                  <div key={`unplaced-${idx}`} className="rounded-lg bg-white/40 border border-dashed border-charcoal/15 px-2.5 py-1.5">
+                    <p className="text-xs text-charcoal/60">
+                      <span className="font-medium">{u.cardTitle}</span>
+                      <span className="text-muted/60 ml-1.5">暂未建议</span>
+                    </p>
+                    <p className="text-[10px] text-muted/60 mt-0.5 leading-snug">{u.reason}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-muted/50 mt-2">以上是 AI 的建议，仅供参考；最终怎么安排，由你在下方时间轴自己决定。</p>
             </GlassCard>
           </div>
         )}
@@ -923,20 +910,6 @@ export default function TripPage() {
                         <p className="text-[10px] text-muted/60">今日预算</p>
                         <p className="text-xs font-semibold text-charcoal/85 mt-0.5">已花 ¥{totalExpenseAmount}</p>
                         <p className="text-[10px] text-muted/50">（全程累计）</p>
-                      </div>
-                      <div className="flex-1 rounded-xl bg-emerald-50/60 border border-emerald-200/50 p-2">
-                        <p className="text-[10px] text-muted/60 text-center mb-1">打卡清单</p>
-                        <div className="space-y-0.5">
-                          {selectedCardTitles.slice(0, 8).map((t) => (
-                            <button key={t} onClick={() => toggleSpot(t)} className="w-full flex items-center gap-1 text-left">
-                              <span className="text-[10px]">{checkedSpots.has(t) ? "☑️" : "⬜"}</span>
-                              <span className={`text-[10px] leading-tight ${checkedSpots.has(t) ? "line-through text-muted/50" : "text-charcoal/80"}`}>{t}</span>
-                            </button>
-                          ))}
-                          {selectedCardTitles.length === 0 && (
-                            <p className="text-[10px] text-muted/40 text-center">无</p>
-                          )}
-                        </div>
                       </div>
                     </div>
 
@@ -1035,6 +1008,83 @@ export default function TripPage() {
             );
           })}
         </div>
+
+        {/* ── 🗺 行程空间总览（E4.5 Phase 6-1：地图移至时间轴后——先决定怎么安排，再看空间分布；逻辑与渲染条件不变） ── */}
+        {allMarkers.length > 0 && (
+          <div className="pt-4">
+            <p className="px-4 pb-2 text-[11px] font-medium text-muted/70">🗺 行程空间总览</p>
+            <div className="relative">
+              <AmapView markers={allMarkers} className="w-full h-[30vh]" />
+              <div className="absolute bottom-2 left-3">
+                <GlassCard className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs shadow-sm">
+                  <MapPin className="w-3 h-3 text-vibe-sea" />
+                  <span>{trip.destination} · {allMarkers.length} 个地点</span>
+                </GlassCard>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── L1 旅行事实区（E4.5 Phase 6-1：住宿+天气，移至决策链路之后；数据链路不变） ── */}
+        {prefHotel && (
+          <div className="px-4 pt-3">
+            <p className="text-xs text-charcoal/75 leading-relaxed truncate">
+              🏨 {prefHotel.name}
+              {prefHotel.district ? ` · ${prefHotel.district}` : ""}
+              {prefHotel.address ? `　${prefHotel.address}` : ""}
+            </p>
+          </div>
+        )}
+        {weather && (weather.live || (weather.forecasts?.length ?? 0) > 0) && (
+          <div className="px-4 pt-2 pb-2">
+            <button
+              onClick={() => setWeatherExpanded((v) => !v)}
+              className="w-full flex items-center justify-between rounded-xl bg-white/50 border border-vibe-dusk/15 px-3.5 py-2 text-left"
+            >
+              <span className="text-xs text-charcoal/75">
+                🌤 {weather.city}{weather.live ? ` · ${weather.live.weather} · ${weather.live.temperature}℃` : ""}
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 text-muted/60 transition-transform duration-200 ${weatherExpanded ? "rotate-180" : ""}`} />
+            </button>
+            {weatherExpanded && (
+              <GlassCard className="px-4 py-3 mt-1.5">
+                {weather.live && (
+                  <div className="flex items-center gap-4 mb-2 pb-2 border-b border-white/40">
+                    <div className="flex items-baseline gap-1">
+                      <span className="text-2xl font-semibold text-charcoal">{weather.live.temperature}°</span>
+                      <span className="text-xs text-muted">{weather.live.weather}</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-[11px] text-muted/80">
+                      <span className="flex items-center gap-0.5">
+                        <Droplets className="w-3 h-3" />
+                        {weather.live.humidity}%
+                      </span>
+                      <span className="flex items-center gap-0.5">
+                        <Wind className="w-3 h-3" />
+                        {weather.live.windDirection}风 {weather.live.windPower}级
+                      </span>
+                    </div>
+                  </div>
+                )}
+                {(weather.forecasts ?? []).length > 0 && (
+                  <div className="flex gap-1 overflow-x-auto">
+                    {(weather.forecasts ?? []).slice(0, 4).map((f) => (
+                      <div key={f.date} className="flex-1 min-w-[60px] text-center py-1">
+                        <p className="text-[10px] text-muted/70">{f.date.slice(5)} {f.week}</p>
+                        <p className="text-[11px] text-charcoal/80 my-0.5">{f.dayWeather}</p>
+                        <p className="text-[11px]">
+                          <span className="text-blue-500/80">{f.nightTemp}°</span>
+                          <span className="text-muted/40 mx-0.5">/</span>
+                          <span className="text-amber-600/90">{f.dayTemp}°</span>
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </GlassCard>
+            )}
+          </div>
+        )}
 
         {/* ── 实用贴士 ── */}
         {travelTips.length > 0 && (

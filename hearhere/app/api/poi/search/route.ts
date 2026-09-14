@@ -8,7 +8,8 @@ const CATEGORY_TYPECODES: Record<string, string[]> = {
   attraction: ["110000", "110100", "110200", "140000", "060000"],
   food: ["050000", "050100", "050200", "050300"],
   souvenir: ["060000", "130000"],
-  hotel: ["100000", "100100", "100200"],
+  // E4.5 Phase 4-1 修复：连锁酒店 typecode 为 1001xx（如全季=100105），原前缀 "100100" 漏配导致 hotel 搜索恒空
+  hotel: ["100000", "1001", "100200"],
 };
 
 /**
@@ -57,6 +58,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       city,
       pois: pois.map((p) => ({
+        id: p.poiId,   // E4.5 Phase 4-1：酒店精确选择需要 POI 标识
         name: p.name,
         address: p.address,
         city: p.city,
