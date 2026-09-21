@@ -755,6 +755,8 @@ export interface PlanPromptArgs {
   weatherFacts?: string[];
   /** E4.5 Phase 5：酒店 soft spatial anchor 事实（「酒店：xxx（位于xx区）」+ 最近/最远各3距离行）；无酒店时缺省，prompt 不出现任何酒店字样 */
   hotelFacts?: string[];
+  /** E5-6：交通等占用窗口事实（如「Day 1：13:00-16:00 = 上海自驾前往杭州，已被占用。」）；无则不渲染该段 */
+  occupiedFacts?: string[];
 }
 
 export function planPrompt(args: PlanPromptArgs): string {
@@ -790,6 +792,8 @@ export function planPrompt(args: PlanPromptArgs): string {
 ${(args.hotelFacts ?? []).length > 0 ? `- 住宿事实（用户已确认的酒店，仅作空间参考）：
 ${(args.hotelFacts ?? []).join("\n")}
 注意：酒店仅用于判断地点间的空间关系、当天首尾活动的合理性与路线距离。不要围绕酒店强制安排每日路线，不要把酒店当作行程活动，不要假设用户每天必须在固定时间返回酒店。` : ""}
+${(args.occupiedFacts ?? []).length > 0 ? `- 不可占用时间窗口（系统骨架交通时间，严禁安排任何景点/美食/伴手礼/其他活动）：
+${(args.occupiedFacts ?? []).map((f) => `  ${f}`).join("\n")}` : ""}
 ${rawUserText ? `- 用户原话：「${rawUserText}」` : ""}
 
 # 可安排的卡片白名单（只能从中选择，禁止任何白名单外的地点）

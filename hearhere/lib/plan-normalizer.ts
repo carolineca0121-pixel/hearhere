@@ -214,6 +214,26 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
   }
 
   const usedKeys = new Set<string>(); // cardId（或 legacy title:） 唯一性
+  // E5-6：用户可见降级 —— 被规则拒绝但能解析到白名单卡的 placement 进入 unplaced（不再从建议层消失）。
+  // placedKeys = 已进 placements；demotedKeys = 已降级进 unplaced（每卡最多一次）；两集合即「最终处置」，互不重叠。
+  const placedKeys = new Set<string>();
+  const demotedKeys = new Set<string>();
+  const demote = (pp: Record<string, unknown>, reason: string) => {
+    // 仅在能可靠识别白名单卡时降级（cardId 主、title 仅 legacy 兜底）；无法识别 → 保持 rejected，绝不猜卡
+    const { card } = findCardByRef(cards, {
+      cardId: typeof pp.cardId === "string" ? pp.cardId : undefined,
+      cardTitle: typeof pp.cardTitle === "string" ? pp.cardTitle : undefined,
+    });
+    if (!card) return;
+    const key = card.id ?? `title:${card.title}`;
+    if (placedKeys.has(key) || demotedKeys.has(key)) return;
+    demotedKeys.add(key);
+    result.unplaced.push({
+      cardId: card.id,
+      cardTitle: card.title,
+      reason: `系统提示：${reason}`, // 来源标识：系统规则拒绝 ≠ AI 主动舍弃
+    });
+  };
   const perDayCount: Record<number, number> = {};
   // E4-6：每天已接受 placement 的占用时间（用于活动间 duration 互斥）
   const acceptedSpans = new Map<number, { startMin: number; endMin: number; label: string }[]>();
@@ -234,7 +254,11 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
 
   sortedPlacements.forEach((p: unknown, idx: number) => {
     const rawShort = short(p);
-    const reject = (reason: string) => { result.rejected.push({ raw: rawShort, reason }); };
+    // E5-6：reject 永远记录 rejected（调试）；forDemote 存在时才尝试用户可见降级（无可靠引用的拒绝不降级）
+    const reject = (reason: string, forDemote?: Record<string, unknown>) => {
+      result.rejected.push({ raw: rawShort, reason });
+      if (forDemote) demote(forDemote, reason);
+    };
 
     if (!p || typeof p !== "object" || Array.isArray(p)) {
       reject(`placements[${idx}] 不是对象`); return;
@@ -248,10 +272,10 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     if (!hasRef) { reject("缺少 cardId/cardTitle 引用"); return; }
 
     const day = normalizeDayIndex(pp.dayIndex, dayCount);
-    if (day === null) { reject(`dayIndex 非法或越界（需 1..${dayCount} 的整数）`); return; }
+    if (day === null) { reject(`dayIndex 非法或越界（需 1..${dayCount} 的整数）`, pp); return; }
 
     const time = normalizeTime(pp.time);
-    if (!time) { reject("time 非法（需 HH:MM）"); return; }
+    if (!time) { reject("time 非法（需 HH:MM）", pp); return; }
 
     // 锚点约束：Day1 不能早于到达、末日「开始+duration」不能超过返程（代码执行，不靠 AI 自觉）
     const hour = Number(time.slice(0, 2));
@@ -259,16 +283,16 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     const spanMin = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
     if (anchorCheckEnabled) {
       if (day === 1 && hour < anchors.day1EarliestHour) {
-        reject(`早于 Day1 到达时间（${anchors.day1EarliestHour}:00 前不可排）`); return;
+        reject(`早于 Day1 到达时间（${anchors.day1EarliestHour}:00 前不可排）`, pp); return;
       }
       // 末日结束边界（E4-6 Gate）：start+duration ≤ 返程时刻（贴边允许）
       if (day === dayCount && startMin !== null && startMin + spanMin > anchors.lastDayLatestHour * 60) {
-        reject(`结束于返程之后（${time} 起 ${spanMin} 分钟会超过 ${anchors.lastDayLatestHour}:00 返程）`); return;
+        reject(`结束于返程之后（${time} 起 ${spanMin} 分钟会超过 ${anchors.lastDayLatestHour}:00 返程）`, pp); return;
       }
     }
     // 跨午夜（E4-6 Gate）：MVP 不建模跨天活动，明确拒收而非静默溢出到次日
     if (startMin !== null && startMin + spanMin > 24 * 60) {
-      reject(`活动跨午夜（${time} 起 ${spanMin} 分钟超出当天 24:00），当前版本不支持`); return;
+      reject(`活动跨午夜（${time} 起 ${spanMin} 分钟超出当天 24:00），当前版本不支持`, pp); return;
     }
 
     // 占用区间约束：与交通等已占用时间冲突 → 拒收（duration 是真实规划约束，不只是 UI）
@@ -276,7 +300,7 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     if (startMin !== null && dayIntervals?.length) {
       const hit = dayIntervals.find((iv) => intervalOverlaps(startMin, spanMin, iv));
       if (hit) {
-        reject(`与「${hit.label}」时间冲突（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)} 已被占用）`);
+        reject(`与「${hit.label}」时间冲突（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)} 已被占用）`, pp);
         return;
       }
     }
@@ -287,7 +311,7 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
 
     // 一卡一次
     const key = card.id ?? `title:${card.title}`;
-    if (usedKeys.has(key)) { reject(`重复安排同一张卡「${card.title}」`); return; }
+    if (usedKeys.has(key)) { reject(`重复安排同一张卡「${card.title}」`, pp); return; }
     usedKeys.add(key); // 无论最终接受/溢出，都先占住（防三次引用）
 
     // 每日上限：溢出 → unplaced（代码执行节奏控制）
@@ -324,7 +348,7 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
       const accepted = acceptedSpans.get(day) ?? [];
       const hit = accepted.find((s) => intervalOverlaps(startMin, span, { dayIndex: day, startMin: s.startMin, endMin: s.endMin, label: s.label }));
       if (hit) {
-        reject(`与已安排的「${hit.label}」（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)}）时间重叠`);
+        reject(`与已安排的「${hit.label}」（${minutesToTime(hit.startMin)}-${minutesToTime(hit.endMin)}）时间重叠`, pp);
         return;
       }
     }
@@ -335,6 +359,7 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
     }
 
     (result.placementsByDay[day] ??= []).push(item);
+    placedKeys.add(key); // E5-6：最终处置=已排程
     // E4-6：记录已接受项的占用区间（供后续 placement 互斥检查）
     if (startMin !== null) {
       const span = typeof pp.durationMin === "number" && pp.durationMin > 0 ? pp.durationMin : 60;
@@ -364,7 +389,10 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
         result.rejected.push({ raw: short(u), reason: `unplaced ${reason ?? "匹配失败"}` });
         continue;
       }
-      usedKeys.add(card.id ?? `title:${card.title}`);
+      const uKey = card.id ?? `title:${card.title}`;
+      // E5-6：已有最终处置（已排程/已被系统降级）的卡不再产生第二条 unplaced（情况 E/A）
+      if (placedKeys.has(uKey) || demotedKeys.has(uKey)) continue;
+      usedKeys.add(uKey);
       result.unplaced.push({
         cardId: card.id,
         cardTitle: card.title,
@@ -374,6 +402,10 @@ export function normalizeAiPlan(input: NormalizeInput): NormalizeResult {
   }
 
   // warnings（代码计算）
+  // E5-6 收尾对账：排序校验的时序可能让同卡先被降级、后被合法接受（或反之）——placements 永远是最终处置，撤下其 unplaced 条目
+  if (placedKeys.size > 0 && result.unplaced.length > 0) {
+    result.unplaced = result.unplaced.filter((u) => !placedKeys.has(u.cardId ?? `title:${u.cardTitle}`));
+  }
   for (const [d, c] of Object.entries(perDayCount)) {
     if (c >= maxPerDay) {
       result.warnings.push(`Day ${d} 排满 ${maxPerDay} 项主要安排，节奏偏满`);

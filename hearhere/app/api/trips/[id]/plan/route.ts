@@ -11,7 +11,7 @@ import {
   type PlanAnchors,
   type PlanCardRef,
 } from "@/lib/plan-normalizer";
-import { occupiedIntervalsFor } from "@/lib/duration";
+import { occupiedIntervalsFor, minutesToTime } from "@/lib/duration";
 import { resolvePlanningRules, weatherWarnings, alignWeatherToTripDays } from "@/lib/planning-rules";
 import { geoFactsFor, farPairWarnings, hotelFactsFor } from "@/lib/geo";
 import { getWeather } from "@/lib/amap";
@@ -186,6 +186,10 @@ export async function POST(
         cards.map((c) => ({ title: c.title, location: c.location }))
       ),
       weatherFacts,
+      // E5-6：把 occupiedIntervals 中的交通占用转成模型可读事实（E5-3 benchmark 实证有效）；仅 transport（前往/返回），rest/placeholder 不注入
+      occupiedFacts: occupiedIntervals
+        .filter((iv) => /前往|返回/.test(iv.label))
+        .map((iv) => `Day ${iv.dayIndex}：${minutesToTime(iv.startMin)}-${minutesToTime(iv.endMin)} = ${iv.label}，已被占用。`),
       skeletonFacts: {
         goLabel: goT?.activity,
         goTime: goT?.time,
