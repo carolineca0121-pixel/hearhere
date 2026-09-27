@@ -95,6 +95,8 @@ function getProvider(): {
 interface ChatOptions {
   /** 请求 response_format: { type: "json_object" }。provider 拒绝（400）时自动降级重试一次。 */
   jsonMode?: boolean;
+  /** 覆盖单次调用超时（默认 LLM_TIMEOUT_MS=45000）。E6-1A：rerank 用 35s。 */
+  timeoutMs?: number;
 }
 
 async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promise<string> {
@@ -133,7 +135,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
           max_tokens: maxTokens,
           ...(withJsonFormat ? { response_format: { type: "json_object" } } : {}),
         }),
-        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+        signal: AbortSignal.timeout(opts?.timeoutMs ?? LLM_TIMEOUT_MS),
       });
 
     let res: Response;
@@ -141,7 +143,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
       res = await doFetch(jsonMode);
     } catch (e) {
       if (e instanceof Error && e.name === "TimeoutError") {
-        throw new LocalServiceError(`${name} API 调用超时（>${LLM_TIMEOUT_MS}ms）`, name);
+        throw new LocalServiceError(`${name} API 调用超时（>${opts?.timeoutMs ?? LLM_TIMEOUT_MS}ms）`, name);
       }
       throw e;
     }
@@ -156,7 +158,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
         res = await doFetch(false);
       } catch (e) {
         if (e instanceof Error && e.name === "TimeoutError") {
-          throw new LocalServiceError(`${name} API 调用超时（>${LLM_TIMEOUT_MS}ms）`, name);
+          throw new LocalServiceError(`${name} API 调用超时（>${opts?.timeoutMs ?? LLM_TIMEOUT_MS}ms）`, name);
         }
         throw e;
       }
@@ -254,10 +256,10 @@ export function parseJsonFromText<T>(text: string): T {
 
 export async function ollamaJson<T>(
   prompt: string,
-  opts?: { maxTokens?: number; jsonMode?: boolean; repair?: boolean }
+  opts?: { maxTokens?: number; jsonMode?: boolean; repair?: boolean; timeoutMs?: number }
 ): Promise<T> {
   const maxTokens = opts?.maxTokens ?? 4096;
-  const text = await chat(prompt, maxTokens, { jsonMode: opts?.jsonMode });
+  const text = await chat(prompt, maxTokens, { jsonMode: opts?.jsonMode, timeoutMs: opts?.timeoutMs });
 
   try {
     return parseJsonFromText<T>(text);
