@@ -18,7 +18,9 @@ import { NextResponse } from "next/server";
 import { searchPOIsBatch } from "@/lib/amap";
 import { ollamaJson } from "@/lib/ollama";
 import type { NormalizedPOI } from "@/lib/amap-types";
-import { rankPipeline } from "@/lib/recommend/rank";
+import { rankPipeline, preferenceSignals } from "@/lib/recommend/rank";
+import { buildQueries } from "@/lib/recommend/retrieval";
+import { searchPOIsRouted } from "@/lib/amap";
 
 // Vercel 免费版 Serverless 默认 10s 超时，这个管道要串行 3 次 LLM + N 次高德请求，必须放宽
 export const maxDuration = 60;
@@ -239,18 +241,28 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "缺少目的地" }, { status: 400 });
     }
 
-    // 1. LLM 生成搜索关键词（替代硬编码 tagsToKeywords）
-    const keywords = await llmSearchKeywords(destination, preferences, category, mealType, cuisine, tags.budget);
+    // 1. 召回查询（E6-1B-1）：attraction/food 走确定性多路；hotel/souvenir 保持原链路不变
     const searchCity = resolveAmapCity(destination);
+    const useDeterministic = category === "attraction" || category === "food";
+    const signalsForRetrieval = preferenceSignals([...preferences, ...(tags.constraints || [])], body.rawText);
+    const routedQueries = useDeterministic ? buildQueries(destination, signalsForRetrieval, category) : [];
+    const keywords = useDeterministic
+      ? routedQueries.map((q) => q.keyword)
+      : await llmSearchKeywords(destination, preferences, category, mealType, cuisine, tags.budget);
 
     console.log(`[recommend] destination=${destination}, category=${category}`);
     console.log(`[recommend] keywords=${JSON.stringify(keywords)}, searchCity=${searchCity}`);
+    if (useDeterministic) {
+      console.log(`[recommend] routes=${JSON.stringify(routedQueries.map((q) => `${q.route}→${q.keyword}`))}`);
+    }
 
     // 2. Amap 搜索真实 POI
     let pois: NormalizedPOI[];
     const tAmap = Date.now();
     try {
-      pois = await searchPOIsBatch(searchCity, keywords, 8);
+      pois = useDeterministic
+        ? await searchPOIsRouted(searchCity, routedQueries, 8)
+        : await searchPOIsBatch(searchCity, keywords, 8);
       console.log(`[recommend] Amap returned ${pois.length} POIs, amap=${Date.now() - tAmap}ms`);
     } catch (e) {
       console.error("[recommend] Amap search failed:", e);

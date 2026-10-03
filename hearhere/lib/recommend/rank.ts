@@ -3,6 +3,7 @@
 
 import { ollamaJson } from "@/lib/ollama";
 import type { NormalizedPOI } from "@/lib/amap";
+import { haversineKm } from "@/lib/geo";
 import { preferenceSignals, signalsSummary, type PreferenceSignals } from "./signals";
 
 // ── trace（benchmark/debug 用，不进前端） ────────────────
@@ -15,6 +16,12 @@ export interface ScoreTrace {
   brandPenalty: number;
   localityBoost: number;
   partyPenalty: number;
+  /** E6-1B-2 tie-break 明细（仅打破同分，幅度 <1，不压过偏好分） */
+  routeBonus: number;    // 多路由佐证
+  gradeBonus: number;    // AMap 景区等级（国家级景点）
+  spatialAdj: number;    // 距候选池锚点平滑降权（负值）
+  distKm: number | null;
+  tieAdjust: number;
   total: number;
   matched: string[]; // 命中的信号
 }
@@ -42,6 +49,7 @@ export function scoreCandidate(
   const trace: ScoreTrace = {
     name, poiId: poi.poiId, base: 5,
     interestBoost: 0, mobilityPenalty: 0, brandPenalty: 0, localityBoost: 0, partyPenalty: 0,
+    routeBonus: 0, gradeBonus: 0, spatialAdj: 0, distKm: null, tieAdjust: 0,
     total: 0, matched: [],
   };
 
@@ -99,14 +107,59 @@ export function scoreCandidate(
   return { poi, score: trace.total, trace };
 }
 
-/** 全池确定性预排序（稳定：同分保持原顺序）。 */
+/** 全池确定性预排序。同分打破：多路由佐证 + AMap 等级 + 空间平滑降权 + poiId 兜底（幅度全部 <1，不压过偏好分）。 */
 export function rankCandidates(
   pois: NormalizedPOI[],
   signals: PreferenceSignals,
   category: string
 ): { ranked: ScoredPOI[]; traces: ScoreTrace[] } {
   const scored = pois.map((p, i) => ({ ...scoreCandidate(p, signals, category), _i: i }));
-  scored.sort((a, b) => b.score - a.score || a._i - b._i);
+
+  // 空间锚点：候选池经纬度中位数（对远郊离群鲁棒；无有效坐标则不施加空间调整）
+  const valid = scored.filter((s) => s.poi.lngWgs84 && s.poi.latWgs84);
+  let anchor: { lng: number; lat: number } | null = null;
+  if (valid.length >= 3) {
+    const mid = (arr: number[]) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+    anchor = { lng: mid(valid.map((s) => s.poi.lngWgs84)), lat: mid(valid.map((s) => s.poi.latWgs84)) };
+  }
+
+  for (const s of scored) {
+    const t = s.trace;
+    // 多路由佐证：被越多独立路由召回，证据越强（封顶 4 路）
+    const routes = s.poi.sourceRoutes?.length ?? 0;
+    t.routeBonus = Math.min(routes, 4) * 0.15;
+    // AMap 景区等级（官方语义，通用信号）
+    t.gradeBonus = /国家级景点/.test(s.poi.type) ? 0.25 : 0;
+    // 类目对齐：景点页优先真景点（购物/餐饮误入不加分），美食页同理
+    const typeHead = (s.poi.type || "").split(";")[0] || "";
+    const align = category === "attraction" ? typeHead === "风景名胜" : category === "food" ? typeHead === "餐饮服务" : true;
+    if (align) t.gradeBonus += 0.1;
+    // 伞下子景点让位母景区（通用规则：「母景区-子景点」命名结构）
+    const dash = s.poi.name.indexOf("-");
+    if (dash > 1) {
+      const parent = s.poi.name.slice(0, dash);
+      if (scored.some((o) => o !== s && o.poi.name === parent)) {
+        t.gradeBonus -= 0.2;
+        t.matched.push("umbrella-child-0.2");
+      }
+    }
+    // 空间：距锚点平滑降权，无硬阈值（0km→0，30km→-0.15，133km→-0.665 封顶 -0.75）
+    if (anchor) {
+      const d = haversineKm({ lng: s.poi.lngWgs84, lat: s.poi.latWgs84 }, anchor);
+      t.distKm = d === null ? null : Math.round(d * 10) / 10;
+      t.spatialAdj = d === null ? 0 : -Math.min(d, 150) / 200;
+    }
+    t.tieAdjust = Math.round((t.routeBonus + t.gradeBonus + t.spatialAdj) * 1000) / 1000;
+    if (t.routeBonus > 0) t.matched.push(`routes×${routes}+${t.routeBonus}`);
+    if (t.gradeBonus > 0) t.matched.push("grade:国家级+0.25");
+    if (t.spatialAdj < -0.1) t.matched.push(`spatial:${t.distKm}km${t.spatialAdj}`);
+  }
+
+  scored.sort((a, b) =>
+    b.score - a.score ||
+    b.trace.tieAdjust - a.trace.tieAdjust ||
+    (a.poi.poiId || a.poi.name).localeCompare(b.poi.poiId || b.poi.name)
+  );
   return { ranked: scored, traces: scored.map((s) => s.trace) };
 }
 

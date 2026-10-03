@@ -13,6 +13,8 @@ export interface NormalizedPOI {
   latWgs84: number;
   poiId: string;
   searchKeyword: string;
+  /** E6-1B-1：该候选由哪些召回路由带来（仅 attraction/food 确定性多路召回填充） */
+  sourceRoutes?: string[];
 }
 
 // ── GCJ-02 → WGS84 坐标转换 ──────────────────────────

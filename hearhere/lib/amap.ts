@@ -67,13 +67,14 @@ export async function searchPOI(params: {
 
   if (!response.ok) throw new Error(`Amap API HTTP ${response.status}`);
   const data = (await response.json()) as AmapPOISearchResponse;
-  if (data.status !== "1") throw new Error(`Amap API: ${data.info} (keywords=${params.keywords})`);
+  if (data.status !== "1") throw new Error(`Amap API: ${data.info} infocode=${data.infocode} (keywords=${params.keywords})`);
   return data;
 }
 
 interface AmapPOISearchResponse {
   status: string;
   info: string;
+  infocode?: string;
   count: string;
   pois: Array<{
     id: string;
@@ -91,57 +92,94 @@ interface AmapPOISearchResponse {
 /**
  * 批量搜索 POI，按关键词逐一搜索，去重返回。
  */
+// ── E6-1B-1：受控并发批量召回（并发≤3 + 10021/10020 有限退避重试） ──
+
+const AMAP_CONCURRENCY = 3;
+const RETRYABLE = /10021|10020/;
+const BACKOFF_MS = [600, 1200, 2400];
+
+async function searchWithRetry(keyword: string, city: string): Promise<AmapPOISearchResponse | null> {
+  for (let attempt = 0; attempt <= BACKOFF_MS.length; attempt++) {
+    try {
+      return await searchPOI({ keywords: keyword, city, offset: 20 });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (RETRYABLE.test(msg) && attempt < BACKOFF_MS.length) {
+        await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+        continue;
+      }
+      // 真错误或重试耗尽：不吞错——记录并返回 null（该路由贡献为空，不丢其他路由）
+      console.warn(`[amap] Search failed for "${keyword}" in ${city}:`, msg);
+      return null;
+    }
+  }
+  return null;
+}
+
+function normalizeAmapPoi(poi: AmapPOISearchResponse["pois"][number], city: string, searchKeyword: string): NormalizedPOI {
+  const [lngStr, latStr] = (poi.location || ",").split(",");
+  const gcjLng = parseFloat(lngStr);
+  const gcjLat = parseFloat(latStr);
+  let wgs84 = { lng: gcjLng, lat: gcjLat };
+  if (!isNaN(gcjLng) && !isNaN(gcjLat)) wgs84 = gcj02ToWgs84(gcjLng, gcjLat);
+  return {
+    name: poi.name,
+    address: poi.address || "",
+    city: poi.cityname || city,
+    district: poi.adname || "",
+    type: poi.type || "",
+    typecode: poi.typecode || "",
+    lngWgs84: Math.round(wgs84.lng * 1e6) / 1e6,
+    latWgs84: Math.round(wgs84.lat * 1e6) / 1e6,
+    poiId: poi.id,
+    searchKeyword,
+  };
+}
+
+/** 兼容旧签名：string[] 关键词，并发≤3 受控执行，行为与旧串行一致（名称去重、单路失败不阻断）。 */
 export async function searchPOIsBatch(
   city: string,
   keywords: string[],
   limit = 5,
 ): Promise<NormalizedPOI[]> {
-  const seen = new Set<string>();
-  const results: NormalizedPOI[] = [];
+  return searchPOIsRouted(city, keywords.map((keyword) => ({ keyword, route: "base" })), limit);
+}
 
-  for (const keyword of keywords) {
-    const trimmed = keyword.trim();
-    if (!trimmed) continue;
+/** E6-1B-1：带路由标签的批量召回。同 POI 被多路由召回时 sourceRoutes 合并。 */
+export async function searchPOIsRouted(
+  city: string,
+  queries: Array<{ keyword: string; route: string }>,
+  limit = 5,
+): Promise<NormalizedPOI[]> {
+  const byName = new Map<string, NormalizedPOI>();
+  const tasks = queries
+    .map((q) => ({ keyword: q.keyword.trim(), route: q.route }))
+    .filter((q) => q.keyword.length > 0);
 
-    try {
-      const data = await searchPOI({ keywords: trimmed, city, offset: 20 });
-
+  // 并发≤3 工作池
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(AMAP_CONCURRENCY, tasks.length) }, async () => {
+    while (cursor < tasks.length) {
+      const task = tasks[cursor++];
+      const data = await searchWithRetry(task.keyword, city);
+      if (!data) continue;
       for (const poi of data.pois.slice(0, limit)) {
         const key = poi.name.trim();
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        const [lngStr, latStr] = (poi.location || ",").split(",");
-        const gcjLng = parseFloat(lngStr);
-        const gcjLat = parseFloat(latStr);
-        let wgs84 = { lng: gcjLng, lat: gcjLat };
-        if (!isNaN(gcjLng) && !isNaN(gcjLat)) {
-          wgs84 = gcj02ToWgs84(gcjLng, gcjLat);
+        const existing = byName.get(key);
+        if (existing) {
+          if (task.route && !(existing.sourceRoutes || []).includes(task.route)) {
+            existing.sourceRoutes = [...(existing.sourceRoutes || []), task.route];
+          }
+          continue;
         }
-
-        results.push({
-          name: poi.name,
-          address: poi.address || "",
-          city: poi.cityname || city,
-          district: poi.adname || "",
-          type: poi.type || "",
-          typecode: poi.typecode || "",
-          lngWgs84: Math.round(wgs84.lng * 1e6) / 1e6,
-          latWgs84: Math.round(wgs84.lat * 1e6) / 1e6,
-          poiId: poi.id,
-          searchKeyword: trimmed,
-        });
+        const normalized = normalizeAmapPoi(poi, city, task.keyword);
+        normalized.sourceRoutes = task.route ? [task.route] : [];
+        byName.set(key, normalized);
       }
-    } catch (e) {
-      console.warn(`[amap] Search failed for "${trimmed}" in ${city}:`, e);
     }
-
-    if (keywords.length > 1) {
-      await new Promise((r) => setTimeout(r, 250));
-    }
-  }
-
-  return results;
+  });
+  await Promise.all(workers);
+  return Array.from(byName.values());
 }
 
 export function isAttraction(poi: NormalizedPOI): boolean {
