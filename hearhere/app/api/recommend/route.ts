@@ -19,7 +19,7 @@ import { searchPOIsBatch } from "@/lib/amap";
 import { ollamaJson } from "@/lib/ollama";
 import type { NormalizedPOI } from "@/lib/amap-types";
 import { rankPipeline, preferenceSignals } from "@/lib/recommend/rank";
-import { buildQueries } from "@/lib/recommend/retrieval";
+import { buildQueries, getDestinationHints, HINT_MAX_PER_CATEGORY, type HintsResult } from "@/lib/recommend/retrieval";
 import { searchPOIsRouted } from "@/lib/amap";
 
 // Vercel 免费版 Serverless 默认 10s 超时，这个管道要串行 3 次 LLM + N 次高德请求，必须放宽
@@ -241,13 +241,22 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "缺少目的地" }, { status: 400 });
     }
 
-    // 1. 召回查询（E6-1B-1）：attraction/food 走确定性多路；hotel/souvenir 保持原链路不变
+    // 1. 召回查询（E6-1B-1 确定性多路 + E6-1B-3 可选 hints 通道；hotel/souvenir 保持原链路不变）
     const searchCity = resolveAmapCity(destination);
     const useDeterministic = category === "attraction" || category === "food";
     const signalsForRetrieval = preferenceSignals([...preferences, ...(tags.constraints || [])], body.rawText);
     const routedQueries = useDeterministic ? buildQueries(destination, signalsForRetrieval, category) : [];
+    const detKeywords = routedQueries.map((q) => q.keyword);
+
+    // hints LLM 与确定性 AMap 召回【真并行】：先启动 hints，再启动确定性召回
+    const tHintsStart = Date.now();
+    const hintsPromise = useDeterministic
+      ? getDestinationHints(destination, category, signalsForRetrieval, detKeywords)
+      : Promise.resolve({ hints: [], cacheHit: false, timedOut: false, failed: false, latencyMs: 0 } as HintsResult);
+    console.log(`[hints] start t=0`);
+
     const keywords = useDeterministic
-      ? routedQueries.map((q) => q.keyword)
+      ? detKeywords
       : await llmSearchKeywords(destination, preferences, category, mealType, cuisine, tags.budget);
 
     console.log(`[recommend] destination=${destination}, category=${category}`);
@@ -256,7 +265,7 @@ export async function POST(request: Request) {
       console.log(`[recommend] routes=${JSON.stringify(routedQueries.map((q) => `${q.route}→${q.keyword}`))}`);
     }
 
-    // 2. Amap 搜索真实 POI
+    // 2. Amap 搜索真实 POI（确定性路由；hints 通道在下方合流）
     let pois: NormalizedPOI[];
     const tAmap = Date.now();
     try {
@@ -269,7 +278,32 @@ export async function POST(request: Request) {
       return NextResponse.json({ pois: [], count: 0, _error: `amap: ${e instanceof Error ? e.message : String(e)}` });
     }
 
-    // 3. 去重 + 质量过滤
+    // 2.5 hints 通道合流（E6-1B-3）：LLM 专名 → 高德 → 按名合并进候选池（route=hints 可追踪）
+    const hintsResult = await hintsPromise;
+    let hintQueryCount = 0;
+    if (useDeterministic && hintsResult.hints.length > 0) {
+      const hintQueries = hintsResult.hints.slice(0, HINT_MAX_PER_CATEGORY).map((kw) => ({ keyword: kw, route: "hints" }));
+      hintQueryCount = hintQueries.length;
+      const tHintAmap = Date.now();
+      const hintPois = await searchPOIsRouted(searchCity, hintQueries, 8);
+      console.log(`[hints] amap done: ${hintPois.length} POIs, ${Date.now() - tHintAmap}ms, llmLatency=${hintsResult.latencyMs}ms, cacheHit=${hintsResult.cacheHit}, timedOut=${hintsResult.timedOut}`);
+      const byName = new Map(pois.map((p) => [p.name.trim(), p]));
+      for (const hp of hintPois) {
+        const key = hp.name.trim();
+        const existing = byName.get(key);
+        if (existing) {
+          existing.sourceRoutes = Array.from(new Set([...(existing.sourceRoutes || []), ...(hp.sourceRoutes || [])]));
+        } else {
+          byName.set(key, hp);
+          pois.push(hp);
+        }
+      }
+    } else if (useDeterministic) {
+      console.log(`[hints] 跳过（${hintsResult.timedOut ? "timeout" : hintsResult.failed ? "error" : hintsResult.cacheHit ? "cache空" : "无hints"}），确定性召回不受影响`);
+    }
+    console.log(`[recommend] parallel-proof: hintsStart=0ms deterministicAmapStart=${tAmap - tHintsStart}ms hintsEnd=${tHintsStart + hintsResult.latencyMs - tHintsStart}ms`);
+
+    // 3. 去重 + 质量过滤（hints 候选同样过 dedup/TRASH，不绕过任何过滤）
     pois = deduplicate(pois.filter((p) => !isTrash(p)));
     console.log(`[recommend] after dedup+filter: ${pois.length} POIs`);
 
@@ -309,6 +343,7 @@ export async function POST(request: Request) {
       count: items.length,
       _debug: {
         keywords, searchCity, llmOnline,
+        hints: { generated: hintsResult.hints.length, queryCount: hintQueryCount, cacheHit: hintsResult.cacheHit, timedOut: hintsResult.timedOut, latencyMs: hintsResult.latencyMs },
         traces: traces.slice(0, 15).map((t) => ({ name: t.name, total: t.total, matched: t.matched })),
       },
       _v: 3,
