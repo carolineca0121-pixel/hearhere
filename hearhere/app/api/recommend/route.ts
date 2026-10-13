@@ -20,31 +20,11 @@ import { ollamaJson } from "@/lib/ollama";
 import type { NormalizedPOI } from "@/lib/amap-types";
 import { rankPipeline, preferenceSignals } from "@/lib/recommend/rank";
 import { buildQueries, getDestinationHints, HINT_MAX_PER_CATEGORY, type HintsResult } from "@/lib/recommend/retrieval";
+import { dedupePOIs } from "@/lib/recommend/normalize";
 import { searchPOIsRouted } from "@/lib/amap";
 
 // Vercel 免费版 Serverless 默认 10s 超时，这个管道要串行 3 次 LLM + N 次高德请求，必须放宽
 export const maxDuration = 60;
-
-// ── 去重 ──────────────────────────────────────────────
-
-function deduplicate(pois: NormalizedPOI[]): NormalizedPOI[] {
-  const result: NormalizedPOI[] = [];
-  const seen = new Set<string>();
-
-  for (const p of pois) {
-    const core = p.name
-      .replace(/（.*?）|\(.*?\)/g, "")
-      .replace(/(放生池|客堂|流通处|售票处|停车场|入口|出口|东门|西门|南门|北门|停车场).*$/, "")
-      .replace(/(店|分店|旗舰店).*$/, "")
-      .trim();
-
-    if (core.length < 2) continue;
-    if (seen.has(core)) continue;
-    seen.add(core);
-    result.push({ ...p, name: core });
-  }
-  return result;
-}
 
 // ── 质量过滤 ──────────────────────────────────────────
 
@@ -303,8 +283,8 @@ export async function POST(request: Request) {
     }
     console.log(`[recommend] parallel-proof: hintsStart=0ms deterministicAmapStart=${tAmap - tHintsStart}ms hintsEnd=${tHintsStart + hintsResult.latencyMs - tHintsStart}ms`);
 
-    // 3. 去重 + 质量过滤（hints 候选同样过 dedup/TRASH，不绕过任何过滤）
-    pois = deduplicate(pois.filter((p) => !isTrash(p)));
+    // 3. 去重 + 质量过滤（E6-1C：poiId 身份 + normalizedName 归并；hints 候选同此规则）
+    pois = dedupePOIs(pois.filter((p) => !isTrash(p)), category);
     console.log(`[recommend] after dedup+filter: ${pois.length} POIs`);
 
     // 4. 排序链路（E6-1A）：代码预排序 → Top15 → LLM 终审 → 失败保留代码序+模板推荐语
