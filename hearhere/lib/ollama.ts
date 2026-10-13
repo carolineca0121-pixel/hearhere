@@ -97,11 +97,16 @@ interface ChatOptions {
   jsonMode?: boolean;
   /** 覆盖单次调用超时（默认 LLM_TIMEOUT_MS=45000）。E6-1A：rerank 用 35s。 */
   timeoutMs?: number;
+  /** E6-INFRA-1：call-level 共享 deadline。一次完整调用（含 retry/fallback/repair）共用同一 AbortSignal。 */
+  signal?: AbortSignal;
 }
 
 async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promise<string> {
   const provider = getProvider();
   const jsonMode = opts?.jsonMode === true;
+  // call-level 墙钟：所有 attempt（jsonMode 降级/provider fallback）共享这一个 signal
+  const callSignal = opts?.signal ?? AbortSignal.timeout(opts?.timeoutMs ?? LLM_TIMEOUT_MS);
+  const callTimeoutMs = opts?.timeoutMs ?? LLM_TIMEOUT_MS;
 
   const tryChat = async (
     apiKey: string,
@@ -135,7 +140,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
           max_tokens: maxTokens,
           ...(withJsonFormat ? { response_format: { type: "json_object" } } : {}),
         }),
-        signal: AbortSignal.timeout(opts?.timeoutMs ?? LLM_TIMEOUT_MS),
+        signal: callSignal,
       });
 
     let res: Response;
@@ -143,7 +148,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
       res = await doFetch(jsonMode);
     } catch (e) {
       if (e instanceof Error && e.name === "TimeoutError") {
-        throw new LocalServiceError(`${name} API 调用超时（>${opts?.timeoutMs ?? LLM_TIMEOUT_MS}ms）`, name);
+        throw new LocalServiceError(`${name} API 调用超时（>${callTimeoutMs}ms）`, name);
       }
       throw e;
     }
@@ -158,7 +163,7 @@ async function chat(prompt: string, maxTokens = 4096, opts?: ChatOptions): Promi
         res = await doFetch(false);
       } catch (e) {
         if (e instanceof Error && e.name === "TimeoutError") {
-          throw new LocalServiceError(`${name} API 调用超时（>${opts?.timeoutMs ?? LLM_TIMEOUT_MS}ms）`, name);
+          throw new LocalServiceError(`${name} API 调用超时（>${callTimeoutMs}ms）`, name);
         }
         throw e;
       }
@@ -259,19 +264,23 @@ export async function ollamaJson<T>(
   opts?: { maxTokens?: number; jsonMode?: boolean; repair?: boolean; timeoutMs?: number }
 ): Promise<T> {
   const maxTokens = opts?.maxTokens ?? 4096;
-  const text = await chat(prompt, maxTokens, { jsonMode: opts?.jsonMode, timeoutMs: opts?.timeoutMs });
+  const timeoutMs = opts?.timeoutMs ?? LLM_TIMEOUT_MS;
+  // E6-INFRA-1：call-level 共享 deadline——本次调用（含 retry/fallback/repair）共用此 signal
+  const callSignal = AbortSignal.timeout(timeoutMs);
+  const text = await chat(prompt, maxTokens, { jsonMode: opts?.jsonMode, timeoutMs, signal: callSignal });
 
   try {
     return parseJsonFromText<T>(text);
   } catch (e) {
     // 可选单次 repair pass（默认关闭）：把损坏的输出交给 LLM 修一次，绝不循环
+    // E6-INFRA-1：repair 共享原始 deadline——若首轮已消耗大半预算，repair 只剩余额
     if (opts?.repair) {
       console.warn("[ollama] JSON 解析失败，执行单次 repair pass");
       const repairedText = await chat(
         "下面的内容本应是一个 JSON，但格式已损坏。请只输出修复后的合法 JSON 本身，不要输出任何解释、注释或额外文字：\n\n" +
           text.slice(0, 3000),
         maxTokens,
-        { jsonMode: true }
+        { jsonMode: true, timeoutMs, signal: callSignal }
       );
       return parseJsonFromText<T>(repairedText);
     }
@@ -281,10 +290,11 @@ export async function ollamaJson<T>(
 
 export async function ollamaChat(
   prompt: string,
-  opts?: { maxTokens?: number }
+  opts?: { maxTokens?: number; timeoutMs?: number }
 ): Promise<string> {
   const maxTokens = opts?.maxTokens ?? 2048;
-  return chat(prompt, maxTokens);
+  const timeoutMs = opts?.timeoutMs ?? LLM_TIMEOUT_MS;
+  return chat(prompt, maxTokens, { timeoutMs, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 // ── 视觉模型（截图提取行程） ──────────────────────────
