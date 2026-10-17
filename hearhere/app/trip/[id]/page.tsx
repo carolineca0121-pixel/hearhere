@@ -9,7 +9,7 @@ import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/m
 import type { VibeTheme, DayPlanItem } from "@/lib/types";
 import type { NormalizeResult } from "@/lib/plan-normalizer";
 import { suggestionFingerprint, resultToSuggestions, readSuggestionsFromPreferences, suggestionLabel, suggestedTimeToPeriod, type AiSuggestions } from "@/lib/suggestions";
-import { occupiedIntervalsFor, minutesToTime, intervalOverlaps, timeToMinutes } from "@/lib/duration";
+import { occupiedIntervalsFor, minutesToTime, intervalOverlaps, timeToMinutes, parseDurationHours } from "@/lib/duration";
 import { inMealWindow } from "@/lib/plan-normalizer";
 import { isOutdoorishCard } from "@/lib/planning-rules";
 import { haversineKm, FAR_PAIR_KM } from "@/lib/geo";
@@ -141,6 +141,13 @@ export default function TripPage() {
   const [pickedCard, setPickedCard] = useState<PoolCard | null>(null);
   const dragCardRef = useRef<PoolCard | null>(null);
   const [savingDays, setSavingDays] = useState(false);
+  // E6-2-1：行程编辑器——已安排项编辑 / 自定义活动
+  type EditingState = {
+    dayIndex: number; item: DayPlanItem; isCustom: boolean;
+    name: string; day: number; startMin: number; durationH: number;
+  };
+  const [editing, setEditing] = useState<EditingState | null>(null);
+  const [customDraft, setCustomDraft] = useState<{ dayIndex: number; startMin: number } | null>(null);
   // E3-3：AI 自动规划状态机（idle/planning/failed）+ 失败类别（plan=LLM失败 / save=落库失败）+ 空结果轻提示
   const [planState, setPlanState] = useState<"idle" | "planning" | "failed">("idle");
   const [planErrorKind, setPlanErrorKind] = useState<"" | "plan" | "save">("");
@@ -303,6 +310,97 @@ export default function TripPage() {
     const next = { ...editDays };
     next[dayIndex] = (next[dayIndex] ?? []).filter((it) => !samePlacedItem(it, target));
     setEditDays(next);
+    persistDays(next);
+  };
+
+  // ── E6-2-1：编辑已安排项（Day/开始时间/时长/删除）+ 自定义活动 ──────────
+  const HALF_HOUR_OPTIONS: number[] = [];
+  for (let m = 6 * 60; m <= 23 * 60 + 30; m += 30) HALF_HOUR_OPTIONS.push(m);
+  const DURATION_OPTIONS = [1, 1.5, 2, 3];
+  const durationLabel = (h: number) => `约 ${h} 小时`;
+
+  const openItemEditor = (dayIndex: number, item: DayPlanItem) => {
+    if (item.source === "transport" || item.source === "rest") return; // 骨架锁定项不编辑
+    const startMin = timeToMinutes(item.time) ?? 9 * 60;
+    const durH = parseDurationHours(item.duration) ?? 1;
+    setEditing({
+      dayIndex, item,
+      isCustom: item.source === "custom",
+      name: item.activity, day: dayIndex, startMin, durationH: durH,
+    });
+  };
+
+  // 保存编辑：先按引用移除旧项（不依赖 title 匹配，同名 custom 不误伤），再按新值插入
+  const saveEditedItem = () => {
+    if (!editing) return;
+    const name = editing.name.trim();
+    if (!name) return;
+    const dayCount = sortedDays.length;
+    if (editing.day < 1 || editing.day > dayCount) return;
+    if (editing.durationH <= 0) return;
+    const next = { ...editDays };
+    // 从原位置移除（引用优先，cardId/title 兜底）
+    for (const d of Object.keys(next)) {
+      next[Number(d)] = (next[Number(d)] ?? []).filter((it) => it !== editing.item && !samePlacedItem(it, editing.item));
+    }
+    const timeStr = minutesToTime(editing.startMin);
+    const targetItems = next[editing.day] ?? [];
+    // 冲突检测（复用现有占用区间逻辑；warning-only，不阻止保存）
+    const conflict = occupiedIntervalsFor(targetItems, editing.day, true)
+      .find((iv) => intervalOverlaps(editing.startMin, editing.durationH * 60, iv));
+    const moved: DayPlanItem = {
+      ...editing.item,
+      activity: name,
+      time: timeStr,
+      duration: durationLabel(editing.durationH),
+      ...(conflict ? { userOverride: true } : {}),
+    };
+    targetItems.push(moved);
+    targetItems.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    next[editing.day] = targetItems;
+    setEditDays(next);
+    setEditing(null);
+    if (conflict) {
+      setConflictNotice(`⚠️ AI 提醒：与「${conflict.label}」（${minutesToTime(conflict.startMin)}-${minutesToTime(conflict.endMin)}）时间冲突。已按你的选择保留，可再调整`);
+    }
+    persistDays(next);
+  };
+
+  const deleteEditedItem = () => {
+    if (!editing) return;
+    const next = { ...editDays };
+    for (const d of Object.keys(next)) {
+      next[Number(d)] = (next[Number(d)] ?? []).filter((it) => it !== editing.item && !samePlacedItem(it, editing.item));
+    }
+    setEditDays(next);
+    setEditing(null);
+    persistDays(next);
+  };
+
+  // 自定义活动：空白小时格点击进入创建（pickedCard 为空时）
+  const saveCustomItem = (name: string, durationH: number) => {
+    if (!customDraft) return;
+    const trimmed = name.trim();
+    if (!trimmed || durationH <= 0) return;
+    const next = { ...editDays };
+    const items = next[customDraft.dayIndex] ?? [];
+    const conflict = occupiedIntervalsFor(items, customDraft.dayIndex, true)
+      .find((iv) => intervalOverlaps(customDraft.startMin, durationH * 60, iv));
+    items.push({
+      time: minutesToTime(customDraft.startMin),
+      activity: trimmed,
+      duration: durationLabel(durationH),
+      source: "custom",
+      origin: "user",
+      ...(conflict ? { userOverride: true } : {}),
+    });
+    items.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    next[customDraft.dayIndex] = items;
+    setEditDays(next);
+    setCustomDraft(null);
+    if (conflict) {
+      setConflictNotice(`⚠️ AI 提醒：与「${conflict.label}」（${minutesToTime(conflict.startMin)}-${minutesToTime(conflict.endMin)}）时间冲突。已按你的选择保留，可再调整`);
+    }
     persistDays(next);
   };
 
@@ -931,7 +1029,10 @@ export default function TripPage() {
                                   dragCardRef.current = null;
                                 }
                               }}
-                              onClick={() => { if (pickedCard) placeCard(day.dayIndex, h, pickedCard); }}
+                              onClick={() => {
+                                if (pickedCard) placeCard(day.dayIndex, h, pickedCard);
+                                else setCustomDraft({ dayIndex: day.dayIndex, startMin: h * 60 }); // E6-2-1：空白格 → 自定义活动
+                              }}
                               className={`flex gap-2 items-start py-1 border-b border-charcoal/5 last:border-0 min-h-[32px] ${
                                 canPlace ? "cursor-pointer hover:bg-vibe-sea/5 rounded-lg" : ""
                               }`}
@@ -955,28 +1056,37 @@ export default function TripPage() {
                                 {rowItems.length === 0 ? (
                                   (!continuation || canPlace) && (
                                     <span className={`text-[11px] ${canPlace ? "text-vibe-sea font-medium" : "text-muted/25"}`}>
-                                      {canPlace && pickedCard ? `＋ 点击放入「${pickedCard.title}」` : "·"}
+                                      {canPlace && pickedCard ? `＋ 点击放入「${pickedCard.title}」` : "· ＋ 自定义"}
                                     </span>
                                   )
                                 ) : (
                                   rowItems.map((it: any, idx: number) => {
                                     const fixed = it.source === "transport" || it.source === "rest";
+                                    // E6-2-1：展示真实时间范围（time + duration → end）
+                                    const startMin2 = timeToMinutes(it.time);
+                                    const durH2 = parseDurationHours(it.duration);
+                                    const rangeText = startMin2 !== null && durH2
+                                      ? `${it.time}–${minutesToTime(startMin2 + durH2 * 60)}`
+                                      : null;
                                     return (
                                       <span
                                         key={idx}
-                                        className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs ${
+                                        onClick={(e) => { e.stopPropagation(); if (!fixed) openItemEditor(day.dayIndex, it); }}
+                                        className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs ${!fixed ? "cursor-pointer active:scale-[0.98]" : ""} ${
                                           it.source === "transport"
                                             ? "bg-blue-50 border border-blue-200/60 text-blue-800"
                                             : it.source === "rest"
                                             ? "bg-purple-50 border border-purple-200/60 text-purple-800"
+                                            : it.source === "custom"
+                                            ? "bg-amber-50 border border-amber-300/60 text-amber-900"
                                             : it.source === "food"
                                             ? "bg-green-50 border border-green-200/60 text-green-800"
                                             : "bg-vibe-sea/10 border border-vibe-sea/30 text-charcoal"
                                         }`}
                                       >
-                                        {it.source === "transport" ? "🚄" : it.source === "rest" ? "🏨" : it.source === "food" ? "🍜" : "📍"}
+                                        {it.source === "transport" ? "🚄" : it.source === "rest" ? "🏨" : it.source === "custom" ? "✏️" : it.source === "food" ? "🍜" : "📍"}
+                                        {rangeText && <span className="text-[10px] font-mono opacity-70">{rangeText}</span>}
                                         <span className="font-medium">{it.activity}</span>
-                                        {it.duration && <span className="text-[10px] opacity-60">{it.duration}</span>}
                                         {it.cost && <span className="text-[10px] opacity-60">{it.cost}</span>}
                                         {/* E4-5 可解释性：AI 规划理由真实可见（truncate 保护布局，title 悬浮看全文） */}
                                         {it.note && (
@@ -1302,6 +1412,88 @@ export default function TripPage() {
         </motion.div>
         )}
 
+        {/* ── E6-2-1：行程项编辑底部弹层 ── */}
+        {editing && (
+          <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30" onClick={() => setEditing(null)}>
+            <div className="w-full max-w-md rounded-t-2xl bg-white p-5 pb-8 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-semibold text-charcoal">{editing.isCustom ? "编辑自定义活动" : "调整安排"}</p>
+                <button onClick={() => setEditing(null)} className="text-muted/50 text-lg leading-none">×</button>
+              </div>
+              {editing.isCustom && (
+                <div>
+                  <p className="text-xs text-muted mb-1">活动名称</p>
+                  <input
+                    value={editing.name}
+                    onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+                    className="w-full rounded-xl border border-charcoal/15 px-3 py-2 text-sm"
+                    placeholder="如：自由活动 / 咖啡 / 逛街"
+                  />
+                </div>
+              )}
+              {!editing.isCustom && <p className="text-sm text-charcoal/80">📍 {editing.name}</p>}
+              <div>
+                <p className="text-xs text-muted mb-1">Day</p>
+                <div className="flex gap-1.5 flex-wrap">
+                  {sortedDays.map((d) => (
+                    <button
+                      key={d.dayIndex}
+                      onClick={() => setEditing({ ...editing, day: d.dayIndex })}
+                      className={`px-3 py-1.5 rounded-lg text-xs ${editing.day === d.dayIndex ? "bg-vibe-sea text-white" : "bg-charcoal/5 text-charcoal/70"}`}
+                    >
+                      Day {d.dayIndex}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-muted mb-1">开始时间</p>
+                <div className="grid grid-cols-6 gap-1.5 max-h-32 overflow-y-auto">
+                  {HALF_HOUR_OPTIONS.map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setEditing({ ...editing, startMin: m })}
+                      className={`py-1 rounded-lg text-[11px] font-mono ${editing.startMin === m ? "bg-vibe-sea text-white" : "bg-charcoal/5 text-charcoal/70"}`}
+                    >
+                      {minutesToTime(m)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-muted mb-1">时长</p>
+                <div className="flex gap-1.5">
+                  {DURATION_OPTIONS.map((h) => (
+                    <button
+                      key={h}
+                      onClick={() => setEditing({ ...editing, durationH: h })}
+                      className={`px-3 py-1.5 rounded-lg text-xs ${editing.durationH === h ? "bg-vibe-sea text-white" : "bg-charcoal/5 text-charcoal/70"}`}
+                    >
+                      {h}h
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button onClick={deleteEditedItem} className="px-4 py-2.5 rounded-xl border border-red-200 text-red-500 text-sm">删除</button>
+                <button onClick={saveEditedItem} className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium">保存</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── E6-2-1：自定义活动创建底部弹层 ── */}
+        {customDraft && (
+          <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30" onClick={() => setCustomDraft(null)}>
+            <CustomDraftSheet
+              dayIndex={customDraft.dayIndex}
+              startMin={customDraft.startMin}
+              onCancel={() => setCustomDraft(null)}
+              onSave={saveCustomItem}
+            />
+          </div>
+        )}
+
         {/* ── 底部导航 ── */}
         <div className="px-4 pb-6 pt-2 flex gap-2">
           <button
@@ -1321,5 +1513,61 @@ export default function TripPage() {
         </div>
       </div>
     </>
+  );
+}
+
+// ── E6-2-1：自定义活动创建弹层（局部 state，保存即回传） ──
+function CustomDraftSheet({
+  dayIndex,
+  startMin,
+  onCancel,
+  onSave,
+}: {
+  dayIndex: number;
+  startMin: number;
+  onCancel: () => void;
+  onSave: (name: string, durationH: number) => void;
+}) {
+  const [name, setName] = useState("");
+  const [durationH, setDurationH] = useState(1);
+  const timeStr = minutesToTime(startMin);
+  return (
+    <div className="w-full max-w-md rounded-t-2xl bg-white p-5 pb-8 space-y-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-semibold text-charcoal">✏️ 自定义活动</p>
+        <button onClick={onCancel} className="text-muted/50 text-lg leading-none">×</button>
+      </div>
+      <p className="text-xs text-muted">Day {dayIndex} · {timeStr} 开始</p>
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        className="w-full rounded-xl border border-charcoal/15 px-3 py-2 text-sm"
+        placeholder="如：自由活动 / 咖啡 / 逛街 / 回酒店休息"
+      />
+      <div>
+        <p className="text-xs text-muted mb-1">时长</p>
+        <div className="flex gap-1.5">
+          {[1, 1.5, 2, 3].map((h) => (
+            <button
+              key={h}
+              onClick={() => setDurationH(h)}
+              className={`px-3 py-1.5 rounded-lg text-xs ${durationH === h ? "bg-vibe-sea text-white" : "bg-charcoal/5 text-charcoal/70"}`}
+            >
+              {h}h
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="flex gap-2 pt-1">
+        <button onClick={onCancel} className="px-4 py-2.5 rounded-xl border border-charcoal/15 text-muted text-sm">取消</button>
+        <button
+          onClick={() => name.trim() && onSave(name, durationH)}
+          className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-vibe-sea to-vibe-dusk text-white text-sm font-medium"
+        >
+          加入行程
+        </button>
+      </div>
+    </div>
   );
 }
