@@ -28,6 +28,42 @@ const CAT_DESC: Record<DiscoverCategory, string> = {
 export default function DiscoverPage() {
   const router = useRouter();
   const { tags, _hydrated, selectedContent, addContentCard, removeContentCard, transcript, screenshotPlaces, setScreenshotPlaces, reset } = useSessionStore();
+  // E6-2-2：补充规划模式——/discover?appendTo=<tripId> 时向已有 Trip 追加选卡，不新建
+  const [appendTo, setAppendTo] = useState<string | null>(null);
+  const [appendReady, setAppendReady] = useState(false);
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("appendTo");
+    if (!id) return;
+    setAppendTo(id);
+    // 拉取已有行程的选卡并灌入本地选择状态（同 id 去重；DB 为准）
+    (async () => {
+      try {
+        const res = await fetch(`/api/trips/${id}`);
+        if (!res.ok) throw new Error("fetch failed");
+        const data = await res.json();
+        let pref: any = {};
+        try { pref = JSON.parse(data.trip.preferences || "{}"); } catch { pref = {}; }
+        const existing = Array.isArray(pref.selectedCards) ? pref.selectedCards : [];
+        for (const c of existing) {
+          if (c?.id && c?.title) {
+            addContentCard({
+              id: c.id,
+              title: c.title,
+              description: c.description || "",
+              reason: c.reason || "",
+              category: c.category || "attraction",
+              location: c.location,
+            } as any);
+          }
+        }
+      } catch (e) {
+        console.error("[discover] appendTo 载入失败:", e);
+      } finally {
+        setAppendReady(true);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [activeCategory, setActiveCategory] = useState<DiscoverCategory>("attraction");
   const [allCards, setAllCards] = useState<Record<DiscoverCategory, PoiCardData[]>>({
     attraction: [], food: [], souvenir: [],
@@ -49,7 +85,30 @@ export default function DiscoverPage() {
 
   // ── 🎨 自定义画布：推荐为空/不满意时的逃生舱，绝不卡死用户 ──
   const handleCustomCanvas = async () => {
-    if (!tags?.destination || canvasCreating) return;
+    if (canvasCreating) return;
+    // E6-2-2：补充规划模式——追加选卡到已有 Trip，绝不创建新 Trip（优先于 destination 守卫）
+    if (appendTo) {
+      setCanvasCreating(true);
+      setCanvasError(null);
+      try {
+        const res = await fetch(`/api/trips/${appendTo}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            appendSelectedCards: selectedContent.map((c) => ({ id: c.id, title: c.title, description: c.description, reason: c.reason, location: c.location, category: c.category })),
+          }),
+        });
+        if (!res.ok) throw new Error("保存失败");
+        // 不 reset()：保留本地草稿状态；P4 以 DB 为准重新读取
+        router.push(`/trip/${appendTo}`);
+      } catch (e) {
+        console.error("[discover] append 保存失败:", e);
+        setCanvasError("补充保存失败，请再试一次");
+        setCanvasCreating(false);
+      }
+      return;
+    }
+    if (!tags?.destination) { setCanvasCreating(false); return; }
     setCanvasCreating(true);
     setCanvasError(null);
     try {
@@ -306,6 +365,15 @@ export default function DiscoverPage() {
         </div>
       </div>
 
+      {/* ── E6-2-2：补充规划模式提示条 ── */}
+      {appendTo && (
+        <div className="mx-4 mt-3 rounded-xl bg-vibe-sea/10 border border-vibe-sea/25 px-3 py-2">
+          <p className="text-xs text-charcoal/80">
+            🧩 正在为当前行程补充地点{appendReady ? "" : "（载入原选择中…）"}——保存后回到原行程，已安排的内容不会变
+          </p>
+        </div>
+      )}
+
       {/* ── 标签摘要 ── */}
       {tags && (
         <div className="px-4 -mt-2 relative z-10">
@@ -530,7 +598,7 @@ export default function DiscoverPage() {
             style={{ background: `linear-gradient(135deg, ${activeColor}, ${activeColor}dd)` }}
           >
             <Sparkles className="w-5 h-5" />
-            已选 {selectedContent.length} 项，生成攻略
+            {appendTo ? `补充 ${selectedContent.length} 项到我的行程` : `已选 ${selectedContent.length} 项，生成攻略`}
             <ArrowRight className="w-5 h-5" />
           </button>
         </motion.div>

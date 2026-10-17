@@ -66,6 +66,30 @@ export async function PUT(
         data: { preferences: JSON.stringify(pref) },
       });
     }
+    // E6-2-2：追加选卡（补充规划闭环）——按 card id 合并去重；days/aiSuggestions 不动。
+    if (Array.isArray(body.appendSelectedCards)) {
+      let pref: Record<string, unknown> = {};
+      try { pref = JSON.parse(trip.preferences || "{}"); } catch { pref = {}; }
+      const existing: Array<Record<string, unknown>> = Array.isArray(pref.selectedCards) ? pref.selectedCards as Array<Record<string, unknown>> : [];
+      const seenIds = new Set(existing.map((c) => String(c.id ?? "")));
+      const seenTitles = new Set(existing.map((c) => String(c.title ?? "")));
+      const merged = [...existing];
+      for (const c of body.appendSelectedCards as Array<Record<string, unknown>>) {
+        const cid = String(c.id ?? "");
+        const title = String(c.title ?? "");
+        // 双键去重：id 优先；title 兜底（同一 POI 跨推荐批次 id 可能重建，title 是展示身份）
+        if (!cid && !title) continue;
+        if ((cid && seenIds.has(cid)) || (title && seenTitles.has(title))) continue;
+        if (cid) seenIds.add(cid);
+        if (title) seenTitles.add(title);
+        merged.push(c);
+      }
+      pref.selectedCards = merged;
+      await prisma.trip.update({
+        where: { id: trip.id },
+        data: { preferences: JSON.stringify(pref) },
+      });
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error("[trips PUT]", e);

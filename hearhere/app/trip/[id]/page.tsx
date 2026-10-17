@@ -8,7 +8,7 @@ import { BreathButton } from "@/components/voice/breath-button";
 import { AmapView, CATEGORY_MARKER_COLORS, type MapMarker } from "@/components/map/amap-view";
 import type { VibeTheme, DayPlanItem } from "@/lib/types";
 import type { NormalizeResult } from "@/lib/plan-normalizer";
-import { suggestionFingerprint, resultToSuggestions, readSuggestionsFromPreferences, suggestionLabel, suggestedTimeToPeriod, type AiSuggestions } from "@/lib/suggestions";
+import { suggestionFingerprint, resultToSuggestions, readSuggestionsFromPreferences, suggestionLabel, suggestedTimeToPeriod, type AiSuggestions, type AiSuggestionItem } from "@/lib/suggestions";
 import { occupiedIntervalsFor, minutesToTime, intervalOverlaps, timeToMinutes, parseDurationHours } from "@/lib/duration";
 import { inMealWindow } from "@/lib/plan-normalizer";
 import { isOutdoorishCard } from "@/lib/planning-rules";
@@ -318,6 +318,28 @@ export default function TripPage() {
   for (let m = 6 * 60; m <= 23 * 60 + 30; m += 30) HALF_HOUR_OPTIONS.push(m);
   const DURATION_OPTIONS = [1, 1.5, 2, 3];
   const durationLabel = (h: number) => `约 ${h} 小时`;
+
+  // E6-2-2：AI 建议「安排」→ 打开 E6-2-1 编辑器（创建模式，预填建议 Day/时段）——保存前绝不写 editDays
+  const openSuggestionEditor = (item: AiSuggestionItem) => {
+    const card = cardPool.find((c) => (item.cardId && c.id === item.cardId) || c.title === item.cardTitle);
+    if (!card) return;
+    const raw = timeToMinutes(item.suggestedTime) ?? 9 * 60;
+    const snapped = Math.floor(raw / 30) * 30; // 吸附 30min 格
+    const synthetic: DayPlanItem = {
+      time: minutesToTime(snapped),
+      activity: card.title,
+      source: "selected_card",
+      ...(card.id ? { cardId: card.id } : {}),
+      origin: "user", // 用户确认后才是 user；此处仅为预填，未保存不入 editDays
+      ...(card.location?.lng != null && card.location?.lat != null
+        ? { lng: card.location.lng, lat: card.location.lat }
+        : {}),
+    };
+    setEditing({
+      dayIndex: item.suggestedDay, item: synthetic, isCustom: false,
+      name: card.title, day: item.suggestedDay, startMin: snapped, durationH: 1,
+    });
+  };
 
   const openItemEditor = (dayIndex: number, item: DayPlanItem) => {
     if (item.source === "transport" || item.source === "rest") return; // 骨架锁定项不编辑
@@ -930,6 +952,15 @@ export default function TripPage() {
                           ✓ 你已安排 Day {arranged._day}{arrangedPeriod ? ` · ${arrangedPeriod}` : ""}
                         </p>
                       )}
+                      {/* E6-2-2：建议「安排」→ 打开编辑器由用户确认；不直接落轴 */}
+                      {!arranged && (
+                        <button
+                          onClick={() => openSuggestionEditor(item)}
+                          className="mt-1 text-[10px] font-medium text-vibe-sea border border-vibe-sea/30 rounded-full px-2.5 py-0.5 hover:bg-vibe-sea/10 transition-colors"
+                        >
+                          安排到行程 →
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -1497,11 +1528,11 @@ export default function TripPage() {
         {/* ── 底部导航 ── */}
         <div className="px-4 pb-6 pt-2 flex gap-2">
           <button
-            onClick={() => router.push("/discover")}
+            onClick={() => router.push(`/discover?appendTo=${id}`)}
             className="flex-1 py-2.5 rounded-xl border border-charcoal/10 text-sm text-muted hover:bg-white/50 transition-colors"
           >
             <RotateCcw className="w-3.5 h-3.5 inline mr-1" />
-            再规划一次
+            补充地点
           </button>
           <button
             onClick={() => router.push("/trips")}
